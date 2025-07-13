@@ -6,12 +6,14 @@ use serde::{Deserialize, Serialize};
 mod assets;
 mod metadata;
 mod msgs;
+mod path;
 #[cfg(feature = "nox")]
 mod value;
 
 pub use assets::*;
 pub use metadata::*;
 pub use msgs::*;
+pub use path::*;
 #[cfg(feature = "nox")]
 pub use value::*;
 
@@ -20,11 +22,12 @@ mod gui;
 #[cfg(feature = "gui")]
 pub use gui::*;
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Color {
     pub r: f32,
     pub g: f32,
     pub b: f32,
+    pub a: f32,
 }
 
 impl Color {
@@ -39,9 +42,20 @@ impl Color {
     pub const REDDISH: Self = Self::rgb(0.913, 0.125, 0.0335);
     pub const HYPERBLUE: Self = Self::rgb(0.08, 0.38, 0.82);
     pub const MINT: Self = Self::rgb(0.53, 0.87, 0.62);
+    pub const TRANSPARENT: Self = Self::rgba(0., 0., 0., 0.);
 
     pub const fn rgb(r: f32, g: f32, b: f32) -> Self {
-        Self { r, g, b }
+        Self { r, g, b, a: 1. }
+    }
+
+    pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self { r, g, b, a }
+    }
+}
+
+impl Default for Color {
+    fn default() -> Self {
+        Self::TRANSPARENT
     }
 }
 
@@ -59,7 +73,6 @@ impl impeller2::com_de::Decomponentize for Tick {
     fn apply_value(
         &mut self,
         component_id: impeller2::types::ComponentId,
-        _entity_id: impeller2::types::EntityId,
         value: impeller2::types::ComponentView<'_>,
         _timestamp: Option<Timestamp>,
     ) -> Result<(), Self::Error> {
@@ -113,7 +126,6 @@ impl impeller2::com_de::Decomponentize for SimulationTimeStep {
     fn apply_value(
         &mut self,
         component_id: impeller2::types::ComponentId,
-        _entity_id: impeller2::types::EntityId,
         value: impeller2::types::ComponentView<'_>,
         _timestamp: Option<Timestamp>,
     ) -> Result<(), Self::Error> {
@@ -164,7 +176,6 @@ impl impeller2::com_de::Decomponentize for WorldPos {
     fn apply_value(
         &mut self,
         component_id: impeller2::types::ComponentId,
-        _entity_id: impeller2::types::EntityId,
         value: impeller2::types::ComponentView<'_>,
         _timestamp: Option<Timestamp>,
     ) -> Result<(), Self::Error> {
@@ -212,7 +223,6 @@ impl impeller2::com_de::Decomponentize for CurrentTimestamp {
     fn apply_value(
         &mut self,
         component_id: impeller2::types::ComponentId,
-        _entity_id: impeller2::types::EntityId,
         value: impeller2::types::ComponentView<'_>,
         _timestamp: Option<Timestamp>,
     ) -> Result<(), Self::Error> {

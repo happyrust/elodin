@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{io::Write, net::SocketAddr, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use elodin_db::Server;
@@ -22,7 +22,7 @@ enum Commands {
     #[command(about = "Run a Lua script or launch a REPL")]
     Lua(impeller2_cli::Args),
     #[command(about = "Generate C++ header files")]
-    GenCpp { output_path: PathBuf },
+    GenCpp,
 }
 
 #[derive(clap::Args, Clone, Debug)]
@@ -97,7 +97,7 @@ async fn main() -> miette::Result<()> {
         Commands::Lua(args) => impeller2_cli::run(args)
             .await
             .map_err(|e| miette::miette!(e)),
-        Commands::GenCpp { output_path } => {
+        Commands::GenCpp => {
             let header = postcard_c_codegen::hpp_header(
                 "ELODIN_DB",
                 [
@@ -116,13 +116,13 @@ async fn main() -> miette::Result<()> {
                     impeller2_wkt::VTableStream::to_cpp()?,
                     impeller2_wkt::ComponentMetadata::to_cpp()?,
                     impeller2_wkt::SetComponentMetadata::to_cpp()?,
-                    impeller2_wkt::EntityMetadata::to_cpp()?,
-                    impeller2_wkt::SetEntityMetadata::to_cpp()?,
                     include_str!("../cpp/helpers.hpp").to_string(),
                     include_str!("../cpp/vtable.hpp").to_string(),
                 ],
             )?;
-            std::fs::write(output_path, header).into_diagnostic()?;
+            std::io::stdout()
+                .write_all(header.as_bytes())
+                .into_diagnostic()?;
             Ok(())
         }
     }

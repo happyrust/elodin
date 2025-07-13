@@ -19,6 +19,11 @@ nox.optional = true
 zerocopy.version = "0.8.2"
 zerocopy.features = ["derive"]
 
+
+# data-structs
+smallvec.version = "1.11.2"
+compact_str = "0.9"
+
 # bevy
 bevy.version = "0.16"
 bevy.optional = true
@@ -29,6 +34,8 @@ serde.features = ["derive"]
 postcard.version = "1.1"
 postcard-schema.version = "0.2"
 postcard-schema.features = ["use-std"]
+strum.version = "0.27"
+strum.features = ["derive"]
 
 # lua
 mlua.version = "0.10"

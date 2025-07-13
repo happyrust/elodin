@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use zerocopy::IntoBytes;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 #[serde(tag = "type")]
 pub enum ComponentValue {
     U8(Array<u8, Dyn>),
@@ -17,6 +18,24 @@ pub enum ComponentValue {
     Bool(Array<bool, Dyn>),
     F32(Array<f32, Dyn>),
     F64(Array<f64, Dyn>),
+}
+
+impl std::fmt::Display for ComponentValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::U8(arr) => write!(f, "{}", arr.view()),
+            Self::U16(arr) => write!(f, "{}", arr.view()),
+            Self::U32(arr) => write!(f, "{}", arr.view()),
+            Self::U64(arr) => write!(f, "{}", arr.view()),
+            Self::I8(arr) => write!(f, "{}", arr.view()),
+            Self::I16(arr) => write!(f, "{}", arr.view()),
+            Self::I32(arr) => write!(f, "{}", arr.view()),
+            Self::I64(arr) => write!(f, "{}", arr.view()),
+            Self::Bool(arr) => write!(f, "{}", arr.view()),
+            Self::F32(arr) => write!(f, "{}", arr.view()),
+            Self::F64(arr) => write!(f, "{}", arr.view()),
+        }
+    }
 }
 
 impl ComponentValue {
