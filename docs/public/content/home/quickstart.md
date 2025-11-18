@@ -15,20 +15,7 @@ icon = ""
 
 ## Install
 
-Download the Elodin Client:
-
-| File                                                    | Platform            | Checksum                        |
-| ------------------------------------------------------- | ------------------- | ------------------------------- |
-| [elodin-aarch64-apple-darwin.tar.gz][elodin-macos]      | Apple Silicon macOS | [sha256][elodin-macos-sha256]   |
-| [elodin-x86_64-unknown-linux-gnu.tar.gz][elodin-linux]  | x64 Linux           | [sha256][elodin-linux-sha256]   |
-| [elodin-x86_64-pc-windows-msvc.zip][elodin-windows]     | x64 Windows         | [sha256][elodin-windows-sha256] |
-
-[elodin-macos]: https://storage.googleapis.com/elodin-releases/latest/elodin-aarch64-apple-darwin.tar.gz
-[elodin-macos-sha256]: https://storage.googleapis.com/elodin-releases/latest/elodin-aarch64-apple-darwin.tar.gz.sha256
-[elodin-linux]: https://storage.googleapis.com/elodin-releases/latest/elodin-x86_64-unknown-linux-gnu.tar.gz
-[elodin-linux-sha256]: https://storage.googleapis.com/elodin-releases/latest/elodin-x86_64-unknown-linux-gnu.tar.gz.sha256
-[elodin-windows]: https://storage.googleapis.com/elodin-releases/latest/elodin-x86_64-pc-windows-msvc.zip
-[elodin-windows-sha256]: https://storage.googleapis.com/elodin-releases/latest/elodin-x86_64-pc-windows-msvc.zip.sha256
+Download the Elodin Client from the [releases](https://github.com/elodin-sys/elodin/releases) page.
 
 Install the Elodin Python SDK using `pip`:
 
@@ -40,6 +27,10 @@ The SDK is only supported on macOS and Linux distributions with glibc 2.35+ (Ubu
 ```sh
 pip install -U elodin
 ```
+
+### Upgrading? 
+
+If upgrading from an old Elodin version, consult the [migration guides](/reference/migration/).
 
 ## Start Simulating
 
@@ -57,25 +48,17 @@ In a Windows terminal launch the Elodin app.
 
 In a WSL terminal download and install `elodin` binary into your path then run:
 
-1. Create a new simulation using the three-body orbit template.
-    ```sh
-    elodin create --template three-body
-    ```
-2. Run the simulation server.
-    ```sh
-    elodin run three-body.py
-    ```
+```sh
+elodin run examples/three-body/main.py
+```
+
 
 ### Linux / macOS
 
-1. Create a new simulation using the three-body orbit template.
-    ```sh
-    elodin create --template three-body
-    ```
-2. Launch the simulation using the `elodin` CLI.
-    ```sh
-    elodin editor three-body.py
-    ```
+```sh
+elodin run examples/three-body/main.py
+```
+
 
 ## Perform Analysis
 
@@ -90,10 +73,9 @@ The `ball/plot.py` example depends on `matplotlib`. Install it using `pip`:
 pip install -U matplotlib
 ```
 
-Then create & run the ball template:
+Then run the ball plot example:
 ```sh
-elodin create --template ball
-python3 ball/plot.py
+python3 examples/ball/plot.py
 ```
 
 For more information on data frames check out

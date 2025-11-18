@@ -14,11 +14,10 @@ fn run_python_command(cmd: &str) -> String {
     }
 
     // Get the stdlib path from the command output
-    let output = String::from_utf8(output.stdout)
+    String::from_utf8(output.stdout)
         .expect("Invalid UTF-8 output")
         .trim()
-        .to_string();
-    output
+        .to_string()
 }
 
 #[cfg(not(feature = "jax"))]
@@ -48,7 +47,7 @@ fn main() {
     if shared_lib.exists() {
         let shared_lib_name = shared_lib.file_name().unwrap();
         let shared_lib_dest = python_dir.join(shared_lib_name);
-        std::fs::copy(&shared_lib, &shared_lib_dest).unwrap();
+        let _ = std::fs::copy(&shared_lib, &shared_lib_dest);
     } else {
         println!(
             "cargo:warning=Python shared library not found: {}",

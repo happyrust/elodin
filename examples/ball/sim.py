@@ -14,28 +14,38 @@ BALL_RADIUS = 0.2
 
 def world(seed: int = 0) -> el.World:
     world = el.World()
-    # world.spawn(WindData(seed=jnp.int64(seed)), name="WindData")
-    ball_mesh = world.insert_asset(el.Mesh.sphere(BALL_RADIUS))
-    ball_color = world.insert_asset(el.Material.color(12.7, 9.2, 0.5))
     world.spawn(
         [
             el.Body(world_pos=el.SpatialTransform(linear=jnp.array([0.0, 0.0, 6.0]))),
-            el.Shape(ball_mesh, ball_color),
             WindData(seed=jnp.int64(seed)),
         ],
         name="ball",
     )
-    world.spawn(
-        el.Panel.viewport(
-            active=True,
-            pos="(0.0,0.0,0.0, 0.0, 8.0, 2.0, 4.0)",
-            look_at="(0.0,0.0,0.0,0.0, 0.0, 0.0, 3.0)",
-            show_grid=True,
-            hdr=True,
-        ),
-        name="Viewport",
+
+    world.schematic(
+        """
+        hsplit {
+            viewport name=Viewport pos="(0,0,0,0, 8,2,4)" look_at="(0,0,0,0, 0,0,3)" hdr=#true show_grid=#true active=#true
+        }
+        object_3d ball.world_pos {
+            sphere radius=0.2 {
+                color orange
+            }
+        }
+        line_3d ball.world_pos line_width=2.0 {
+            color white
+        }
+        vector_arrow "ball.world_vel[3],ball.world_vel[4],ball.world_vel[5]" origin="ball.world_pos" scale=1.0 name="Ball Velocity" {
+            color 0 0 255
+        }
+        object_3d "(0,0,0,1, 0,0,0)" {
+            plane width=2000 depth=2000 {
+                color 32 128 32 125
+            }
+        }
+    """,
+        "ball.kdl",
     )
-    world.spawn(el.Line3d("ball.world_pos", line_width=2.0))
     return world
 
 

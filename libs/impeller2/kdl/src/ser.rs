@@ -10,7 +10,9 @@ pub fn serialize_schematic<T>(schematic: &Schematic<T>) -> String {
     }
 
     doc.autoformat();
-    doc.to_string()
+    let mut s = doc.to_string();
+    s.truncate(s.trim_end().len());
+    s
 }
 
 fn serialize_schematic_elem<T>(elem: &SchematicElem<T>) -> KdlNode {
@@ -18,6 +20,8 @@ fn serialize_schematic_elem<T>(elem: &SchematicElem<T>) -> KdlNode {
         SchematicElem::Panel(panel) => serialize_panel(panel),
         SchematicElem::Object3d(obj) => serialize_object_3d(obj),
         SchematicElem::Line3d(line) => serialize_line_3d(line),
+        SchematicElem::VectorArrow(arrow) => serialize_vector_arrow(arrow),
+        SchematicElem::Window(window) => serialize_window(window),
     }
 }
 
@@ -57,6 +61,11 @@ fn serialize_split<T>(split: &Split<T>, is_horizontal: bool) -> KdlNode {
         node.entries_mut().push(KdlEntry::new_prop("active", true));
     }
 
+    if let Some(ref name) = split.name {
+        node.entries_mut()
+            .push(KdlEntry::new_prop("name", name.clone()));
+    }
+
     let mut children = KdlDocument::new();
 
     for (i, panel) in split.panels.iter().enumerate() {
@@ -88,19 +97,6 @@ fn serialize_viewport<T>(viewport: &Viewport<T>) -> KdlNode {
             .push(KdlEntry::new_prop("fov", viewport.fov as f64));
     }
 
-    if viewport.active {
-        node.entries_mut().push(KdlEntry::new_prop("active", true));
-    }
-
-    if viewport.show_grid {
-        node.entries_mut()
-            .push(KdlEntry::new_prop("show_grid", true));
-    }
-
-    if viewport.hdr {
-        node.entries_mut().push(KdlEntry::new_prop("hdr", true));
-    }
-
     if let Some(ref pos) = viewport.pos {
         node.entries_mut()
             .push(KdlEntry::new_prop("pos", pos.clone()));
@@ -109,6 +105,32 @@ fn serialize_viewport<T>(viewport: &Viewport<T>) -> KdlNode {
     if let Some(ref look_at) = viewport.look_at {
         node.entries_mut()
             .push(KdlEntry::new_prop("look_at", look_at.clone()));
+    }
+
+    if viewport.hdr {
+        node.entries_mut().push(KdlEntry::new_prop("hdr", true));
+    }
+
+    if viewport.show_grid {
+        node.entries_mut()
+            .push(KdlEntry::new_prop("show_grid", true));
+    }
+
+    if viewport.active {
+        node.entries_mut().push(KdlEntry::new_prop("active", true));
+    }
+
+    node
+}
+
+fn serialize_window(window: &WindowSchematic) -> KdlNode {
+    let mut node = KdlNode::new("window");
+    node.entries_mut()
+        .push(KdlEntry::new_prop("path", window.path.clone()));
+
+    if let Some(title) = &window.title {
+        node.entries_mut()
+            .push(KdlEntry::new_prop("title", title.clone()));
     }
 
     node
@@ -148,14 +170,18 @@ fn serialize_graph<T>(graph: &Graph<T>) -> KdlNode {
             .push(KdlEntry::new_prop("y_max", graph.y_range.end));
     }
 
+    for color in &graph.colors {
+        serialize_color_to_node(&mut node, color);
+    }
+
     node
 }
 
 fn serialize_component_monitor(monitor: &ComponentMonitor) -> KdlNode {
     let mut node = KdlNode::new("component_monitor");
     node.entries_mut().push(KdlEntry::new_prop(
-        "component_id",
-        monitor.component_id.to_string(),
+        "component_name",
+        monitor.component_name.clone(),
     ));
     node
 }
@@ -246,7 +272,8 @@ fn serialize_object_3d_mesh(mesh: &Object3DMesh) -> KdlNode {
     match mesh {
         Object3DMesh::Glb(path) => {
             let mut node = KdlNode::new("glb");
-            node.entries_mut().push(KdlEntry::new(path.clone()));
+            node.entries_mut()
+                .push(KdlEntry::new_prop("path", path.clone()));
             node
         }
         Object3DMesh::Mesh { mesh, material } => match mesh {
@@ -274,7 +301,27 @@ fn serialize_object_3d_mesh(mesh: &Object3DMesh) -> KdlNode {
                 serialize_material_to_node(&mut node, material);
                 node
             }
+            Mesh::Plane { width, depth } => {
+                let mut node = KdlNode::new("plane");
+                node.entries_mut()
+                    .push(KdlEntry::new_prop("width", *width as f64));
+                node.entries_mut()
+                    .push(KdlEntry::new_prop("depth", *depth as f64));
+                serialize_material_to_node(&mut node, material);
+                node
+            }
         },
+        Object3DMesh::Ellipsoid { scale, color } => {
+            let mut node = KdlNode::new("ellipsoid");
+            node.entries_mut()
+                .push(KdlEntry::new_prop("scale", scale.clone()));
+
+            if color != &default_ellipsoid_color() {
+                serialize_color_to_node(&mut node, color);
+            }
+
+            node
+        }
     }
 }
 
@@ -299,13 +346,74 @@ fn serialize_line_3d<T>(line: &Line3d<T>) -> KdlNode {
     node
 }
 
+fn serialize_vector_arrow<T>(arrow: &VectorArrow3d<T>) -> KdlNode {
+    let mut node = KdlNode::new("vector_arrow");
+    node.entries_mut().push(KdlEntry::new(arrow.vector.clone()));
+
+    if let Some(origin) = &arrow.origin {
+        node.entries_mut()
+            .push(KdlEntry::new_prop("origin", origin.clone()));
+    }
+
+    if (arrow.scale - 1.0).abs() > f64::EPSILON {
+        node.entries_mut()
+            .push(KdlEntry::new_prop("scale", arrow.scale));
+    }
+
+    if let Some(name) = &arrow.name {
+        node.entries_mut()
+            .push(KdlEntry::new_prop("name", name.clone()));
+    }
+
+    if arrow.body_frame {
+        node.entries_mut()
+            .push(KdlEntry::new_prop("body_frame", true));
+    }
+
+    if arrow.normalize {
+        node.entries_mut()
+            .push(KdlEntry::new_prop("normalize", true));
+    }
+
+    serialize_color_to_node(&mut node, &arrow.color);
+
+    node
+}
+
 fn serialize_color_to_node(node: &mut KdlNode, color: &Color) {
-    node.entries_mut()
-        .push(KdlEntry::new_prop("r", color.r as f64));
-    node.entries_mut()
-        .push(KdlEntry::new_prop("g", color.g as f64));
-    node.entries_mut()
-        .push(KdlEntry::new_prop("b", color.b as f64));
+    serialize_color_to_node_named(node, color, None)
+}
+
+fn serialize_color_to_node_named(node: &mut KdlNode, color: &Color, name: Option<&str>) {
+    let mut color_node = KdlNode::new(name.unwrap_or("color"));
+
+    // Add r, g, b as positional arguments
+    let r = float_color_component_to_int(color.r);
+    let g = float_color_component_to_int(color.g);
+    let b = float_color_component_to_int(color.b);
+    color_node.entries_mut().push(KdlEntry::new(r));
+    color_node.entries_mut().push(KdlEntry::new(g));
+    color_node.entries_mut().push(KdlEntry::new(b));
+
+    // Add alpha if it's not 1.0 (default)
+    let a = float_color_component_to_int(color.a);
+    if a != 255 {
+        color_node.entries_mut().push(KdlEntry::new(a));
+    }
+
+    // Add the color node as a child
+    if let Some(existing_children) = node.children_mut().as_mut() {
+        existing_children.nodes_mut().push(color_node);
+    } else {
+        let mut doc = KdlDocument::new();
+        doc.nodes_mut().push(color_node);
+        node.set_children(doc);
+    }
+}
+
+fn float_color_component_to_int(component: f32) -> i128 {
+    let clamped = component.clamp(0.0, 1.0);
+    (clamped * 255.0).round() as i128
 }
 
 fn serialize_material_to_node(node: &mut KdlNode, material: &Material) {
@@ -351,9 +459,9 @@ fn serialize_dashboard_node<T>(dashboard_node: &DashboardNode<T>) -> KdlNode {
         children.nodes_mut().push(bg_node);
     }
 
-    let mut text_color_node = KdlNode::new("text_color");
-    serialize_color_to_node(&mut text_color_node, &dashboard_node.text_color);
-    children.nodes_mut().push(text_color_node);
+    // let mut text_color_node = KdlNode::new("text_color");
+    // serialize_color_to_node_named(&mut text_color_node, &dashboard_node.text_color, Some("text_color"));
+    // children.nodes_mut().push(text_color_node);
 
     // Add regular children
     for child in &dashboard_node.children {
@@ -362,6 +470,7 @@ fn serialize_dashboard_node<T>(dashboard_node: &DashboardNode<T>) -> KdlNode {
 
     node.set_children(children);
 
+    serialize_color_to_node_named(&mut node, &dashboard_node.text_color, Some("text_color"));
     node
 }
 
@@ -546,6 +655,35 @@ mod tests {
     use super::*;
     use crate::parse_schematic;
 
+    const COLOR_EPSILON: f32 = 1.0 / 255.0 + 1e-6;
+
+    fn assert_color_close(actual: Color, expected: Color) {
+        assert!(
+            (actual.r - expected.r).abs() <= COLOR_EPSILON,
+            "expected r ~= {} got {}",
+            expected.r,
+            actual.r
+        );
+        assert!(
+            (actual.g - expected.g).abs() <= COLOR_EPSILON,
+            "expected g ~= {} got {}",
+            expected.g,
+            actual.g
+        );
+        assert!(
+            (actual.b - expected.b).abs() <= COLOR_EPSILON,
+            "expected b ~= {} got {}",
+            expected.b,
+            actual.b
+        );
+        assert!(
+            (actual.a - expected.a).abs() <= COLOR_EPSILON,
+            "expected a ~= {} got {}",
+            expected.a,
+            actual.a
+        );
+    }
+
     #[test]
     fn test_serialize_simple_viewport() {
         let mut schematic = Schematic::default();
@@ -569,10 +707,57 @@ mod tests {
         if let SchematicElem::Panel(Panel::Viewport(viewport)) = &parsed.elems[0] {
             assert_eq!(viewport.name, Some("main".to_string()));
             assert_eq!(viewport.fov, 60.0);
-            assert_eq!(viewport.active, true);
-            assert_eq!(viewport.show_grid, true);
+            assert!(viewport.active);
+            assert!(viewport.show_grid);
         } else {
             panic!("Expected viewport panel");
+        }
+    }
+
+    #[test]
+    fn test_viewport_property_order() {
+        let mut schematic = Schematic::default();
+        schematic
+            .elems
+            .push(SchematicElem::Panel(Panel::Viewport(Viewport {
+                name: Some("main".to_string()),
+                fov: 60.0,
+                active: true,
+                show_grid: true,
+                hdr: true,
+                pos: Some("(0,0,0,0, 1,2,3)".to_string()),
+                look_at: Some("(0,0,0,0, 0,0,0)".to_string()),
+                aux: (),
+            })));
+
+        let serialized = serialize_schematic(&schematic);
+        let viewport_line = serialized
+            .lines()
+            .find(|line| line.trim_start().starts_with("viewport"))
+            .expect("viewport line missing");
+
+        let properties = [
+            "name=",
+            "fov=",
+            "pos=",
+            "look_at=",
+            "hdr=",
+            "show_grid=",
+            "active=",
+        ];
+        let mut indices = Vec::with_capacity(properties.len());
+        for property in properties {
+            let idx = viewport_line
+                .find(property)
+                .unwrap_or_else(|| panic!("{property} missing in `{viewport_line}`"));
+            indices.push(idx);
+        }
+
+        for window in indices.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "expected viewport properties in order name → fov → pos → look_at → hdr → show_grid → active: `{viewport_line}`"
+            );
         }
     }
 
@@ -588,6 +773,7 @@ mod tests {
                 auto_y_range: true,
                 y_range: 0.0..1.0,
                 aux: (),
+                colors: vec![],
             })));
 
         let serialized = serialize_schematic(&schematic);
@@ -601,6 +787,33 @@ mod tests {
         } else {
             panic!("Expected graph panel");
         }
+    }
+
+    #[test]
+    fn test_serialize_graph_with_colors() {
+        let mut schematic = Schematic::default();
+        schematic
+            .elems
+            .push(SchematicElem::Panel(Panel::Graph(Graph {
+                eql: "rocket.fins[2], rocket.fins[3]".to_string(),
+                name: None,
+                graph_type: GraphType::Line,
+                auto_y_range: true,
+                y_range: 0.0..1.0,
+                aux: (),
+                colors: vec![Color::rgb(1.0, 0.0, 0.0), Color::rgb(0.0, 1.0, 0.0)],
+            })));
+
+        let serialized = serialize_schematic(&schematic);
+        let parsed = parse_schematic(&serialized).unwrap();
+
+        assert_eq!(parsed.elems.len(), 1);
+        let SchematicElem::Panel(Panel::Graph(graph)) = &parsed.elems[0] else {
+            panic!("Expected graph panel");
+        };
+        assert_eq!(graph.colors.len(), 2);
+        assert_eq!(graph.colors[0], Color::rgb(1.0, 0.0, 0.0));
+        assert_eq!(graph.colors[1], Color::rgb(0.0, 1.0, 0.0));
     }
 
     #[test]
@@ -641,6 +854,79 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_object_3d_plane() {
+        let mut schematic = Schematic::default();
+        schematic.elems.push(SchematicElem::Object3d(Object3D {
+            eql: "a.world_pos".to_string(),
+            mesh: Object3DMesh::Mesh {
+                mesh: Mesh::Plane {
+                    width: 15.0,
+                    depth: 20.0,
+                },
+                material: Material {
+                    base_color: Color::rgb(0.0, 0.5, 1.0),
+                },
+            },
+            aux: (),
+        }));
+
+        let serialized = serialize_schematic(&schematic);
+        let parsed = parse_schematic(&serialized).unwrap();
+
+        assert_eq!(parsed.elems.len(), 1);
+        let SchematicElem::Object3d(obj) = &parsed.elems[0] else {
+            panic!("Expected object_3d");
+        };
+
+        let Object3DMesh::Mesh { mesh, material } = &obj.mesh else {
+            panic!("Expected mesh object");
+        };
+
+        let Mesh::Plane { width, depth } = mesh else {
+            panic!("Expected plane mesh");
+        };
+
+        assert!((*width - 15.0).abs() < f32::EPSILON);
+        assert!((*depth - 20.0).abs() < f32::EPSILON);
+        assert_eq!(material.base_color.r, 0.0);
+        assert!((material.base_color.g - 128.0 / 255.0).abs() < f32::EPSILON);
+        assert_eq!(material.base_color.b, 1.0);
+    }
+
+    #[test]
+    fn test_serialize_object_3d_ellipsoid() {
+        let mut schematic = Schematic::default();
+        schematic.elems.push(SchematicElem::Object3d(Object3D {
+            eql: "rocket.world_pos".to_string(),
+            mesh: Object3DMesh::Ellipsoid {
+                scale: "rocket.scale".to_string(),
+                color: Color::rgba(64.0 / 255.0, 128.0 / 255.0, 1.0, 96.0 / 255.0),
+            },
+            aux: (),
+        }));
+
+        let serialized = serialize_schematic(&schematic);
+        let parsed = parse_schematic(&serialized).unwrap();
+
+        assert_eq!(parsed.elems.len(), 1);
+        if let SchematicElem::Object3d(obj) = &parsed.elems[0] {
+            assert_eq!(obj.eql, "rocket.world_pos");
+            match &obj.mesh {
+                Object3DMesh::Ellipsoid { scale, color } => {
+                    assert_eq!(scale, "rocket.scale");
+                    assert!((color.r - 64.0 / 255.0).abs() < f32::EPSILON);
+                    assert!((color.g - 128.0 / 255.0).abs() < f32::EPSILON);
+                    assert!((color.b - 1.0).abs() < f32::EPSILON);
+                    assert!((color.a - 96.0 / 255.0).abs() < f32::EPSILON);
+                }
+                _ => panic!("Expected ellipsoid mesh"),
+            }
+        } else {
+            panic!("Expected object_3d");
+        }
+    }
+
+    #[test]
     fn test_serialize_tabs_with_children() {
         let mut schematic = Schematic::default();
         schematic.elems.push(SchematicElem::Panel(Panel::Tabs(vec![
@@ -661,6 +947,7 @@ mod tests {
                 auto_y_range: true,
                 y_range: 0.0..1.0,
                 aux: (),
+                colors: vec![],
             }),
         ])));
 
@@ -706,12 +993,46 @@ mod tests {
         if let SchematicElem::Line3d(line) = &parsed.elems[0] {
             assert_eq!(line.eql, "trajectory");
             assert_eq!(line.line_width, 2.0);
-            assert_eq!(line.color.r, Color::MINT.r);
-            assert_eq!(line.color.g, Color::MINT.g);
-            assert_eq!(line.color.b, Color::MINT.b);
-            assert_eq!(line.perspective, false);
+            assert_color_close(line.color, Color::MINT);
+            assert!(!line.perspective);
         } else {
             panic!("Expected line_3d");
+        }
+    }
+
+    #[test]
+    fn test_serialize_vector_arrow() {
+        let mut schematic = Schematic::default();
+        schematic
+            .elems
+            .push(SchematicElem::VectorArrow(VectorArrow3d {
+                vector: "ball.world_vel[3],ball.world_vel[4],ball.world_vel[5]".to_string(),
+                origin: Some("ball.world_pos".to_string()),
+                scale: 2.5,
+                name: Some("Velocity".to_string()),
+                color: Color::BLUE,
+                body_frame: true,
+                normalize: true,
+                aux: (),
+            }));
+
+        let serialized = serialize_schematic(&schematic);
+        let parsed = parse_schematic(&serialized).unwrap();
+
+        assert_eq!(parsed.elems.len(), 1);
+        if let SchematicElem::VectorArrow(arrow) = &parsed.elems[0] {
+            assert_eq!(
+                arrow.vector,
+                "ball.world_vel[3],ball.world_vel[4],ball.world_vel[5]"
+            );
+            assert_eq!(arrow.origin.as_deref(), Some("ball.world_pos"));
+            assert_eq!(arrow.scale, 2.5);
+            assert_eq!(arrow.name.as_deref(), Some("Velocity"));
+            assert!(arrow.body_frame);
+            assert!(arrow.normalize);
+            assert_color_close(arrow.color, Color::BLUE);
+        } else {
+            panic!("Expected vector_arrow");
         }
     }
 
@@ -724,15 +1045,83 @@ tabs {
 }
 
 object_3d "a.world_pos" {
-    sphere radius=0.2
+    sphere radius=0.2 {
+        color mint
+    }
 }
 "#;
 
         let parsed = parse_schematic(original_kdl).unwrap();
         let serialized = serialize_schematic(&parsed);
+        // NOTE: fov and grid are dropped because they are the default value.
+        //
+        //viewport hdr=#true show_grid=#false active=#true
+        assert_eq!(
+            r#"
+tabs {
+    viewport hdr=#true active=#true
+    graph a.world_pos name="a world_pos"
+}
+object_3d a.world_pos {
+    sphere radius=0.20000000298023224 {
+        color 135 222 158
+    }
+}"#
+            .trim(),
+            serialized
+        );
         let reparsed = parse_schematic(&serialized).unwrap();
 
         // Check that the structure is preserved
+        assert_eq!(parsed.elems.len(), reparsed.elems.len());
+    }
+
+    #[test]
+    fn test_roundtrip_complex_example_color_tuple() {
+        let original_kdl = r#"
+tabs {
+    viewport fov=45.0 active=#true show_grid=#false hdr=#true
+    graph "a.world_pos" name="a world_pos"
+}
+
+object_3d "a.world_pos" {
+    sphere radius=0.2 {
+        color 255 0 255
+    }
+}
+"#;
+        let parsed = parse_schematic(original_kdl).unwrap();
+        let serialized = serialize_schematic(&parsed);
+        // NOTE: fov and grid are dropped because they are the default value.
+        //
+        //viewport hdr=#true show_grid=#false active=#true
+        assert_eq!(
+            r#"
+tabs {
+    viewport hdr=#true active=#true
+    graph a.world_pos name="a world_pos"
+}
+object_3d a.world_pos {
+    sphere radius=0.20000000298023224 {
+        color 255 0 255
+    }
+}"#
+            .trim(),
+            serialized
+        );
+        let reparsed = parse_schematic(&serialized).unwrap();
+
+        // Check that the structure is preserved
+        assert_eq!(parsed.elems.len(), reparsed.elems.len());
+    }
+
+    #[test]
+    fn test_roundtrip_rocket_example() {
+        let original_kdl = r#"graph "rocket.fin_deflect[0]" name=Fin "#;
+        let parsed = parse_schematic(original_kdl).unwrap();
+        let serialized = serialize_schematic(&parsed);
+        assert_eq!(r#"graph "rocket.fin_deflect[0]" name=Fin"#, serialized);
+        let reparsed = parse_schematic(&serialized).unwrap();
         assert_eq!(parsed.elems.len(), reparsed.elems.len());
     }
 
@@ -771,13 +1160,13 @@ object_3d "a.world_pos" {
         if let SchematicElem::Panel(Panel::Dashboard(dashboard)) = &parsed.elems[0] {
             assert_eq!(dashboard.root.label, Some("Styled Dashboard".to_string()));
             assert_eq!(dashboard.root.font_size, 24.0);
-            assert_eq!(dashboard.root.text_color, Color::TURQUOISE);
+            assert_color_close(dashboard.root.text_color, Color::TURQUOISE);
             assert_eq!(dashboard.root.text, Some("Hello World".to_string()));
 
             assert_eq!(dashboard.root.children.len(), 1);
             let child_node = &dashboard.root.children[0];
             assert_eq!(child_node.font_size, 12.0);
-            assert_eq!(child_node.text_color, Color::MINT);
+            assert_color_close(child_node.text_color, Color::MINT);
             assert_eq!(child_node.text, Some("Child Text".to_string()));
         } else {
             panic!("Expected dashboard");

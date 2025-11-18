@@ -12,19 +12,31 @@ cpp! {{
     #include "xla/literal_util.h"
     using namespace xla;
 }}
-cpp_class!(pub unsafe struct Literal as "std::shared_ptr<Literal>");
+cpp_class!(#[derive(Eq)] pub unsafe struct Literal as "std::shared_ptr<Literal>");
+
+impl PartialEq for Literal {
+    fn eq(&self, other: &Self) -> bool {
+        // First check if they're pointing to the same underlying object
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+
+        // If not the same object, compare raw buffers
+        self.raw_buf() == other.raw_buf()
+    }
+}
 
 impl Literal {
     pub fn raw_buf(&self) -> &[u8] {
         let len: Pin<&mut usize> = std::pin::pin!(0);
-        let data = unsafe {
+
+        (unsafe {
             let data = cpp!([self as "std::shared_ptr<Literal>*", len as "size_t*"] -> *const u8 as "const uint8_t*" {
                 *len = (*self)->size_bytes();
                 return (const uint8_t*) (*self)->untyped_data();
             });
             std::slice::from_raw_parts(data, *len)
-        };
-        data
+        }) as _
     }
 
     pub fn primitive_type(&self) -> Result<PrimitiveType> {

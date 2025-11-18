@@ -1,3 +1,4 @@
+use bevy::render::view::RenderLayers;
 use bevy::{
     app::{App, Plugin, Startup, Update},
     ecs::system::{Query, Res, ResMut},
@@ -5,98 +6,102 @@ use bevy::{
         config::{DefaultGizmoConfigGroup, GizmoConfigStore, GizmoLineJoint},
         gizmos::Gizmos,
     },
-    math::Vec3,
+    log::warn,
+    math::{DQuat, DVec3},
+    prelude::Color,
     transform::components::Transform,
 };
-use impeller::{
-    bevy::{ComponentValueMap, EntityMap},
-    well_known::{BodyAxes, VectorArrow, WorldPos},
+use big_space::FloatingOriginSettings;
+use impeller2::types::ComponentId;
+use impeller2_bevy::EntityMap;
+use impeller2_wkt::{
+    BodyAxes, Color as WktColor, ComponentValue as WktComponentValue, VectorArrow3d,
 };
-use nox::{Quaternion, Vector3};
+
+use crate::{
+    WorldPosExt,
+    object_3d::ComponentArrayExt,
+    vector_arrow::{VectorArrowState, component_value_tail_to_vec3},
+};
+
+pub const GIZMO_RENDER_LAYER: usize = 30;
+const MIN_ARROW_LENGTH_SQUARED: f64 = 1.0e-6;
 
 pub struct GizmoPlugin;
 
 impl Plugin for GizmoPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, gizmo_setup);
-        app.add_systems(Update, render_vector_arrow);
+        // This is how the `big_space` crate did it.
+        // app.add_systems(PostUpdate, render_vector_arrow.after(TransformSystem::TransformPropagate));
+        app.add_systems(bevy::app::PreUpdate, render_vector_arrow);
         app.add_systems(Update, render_body_axis);
     }
 }
 
 fn gizmo_setup(mut config_store: ResMut<GizmoConfigStore>) {
     let (config, _) = config_store.config_mut::<DefaultGizmoConfigGroup>();
-    config.line_width = 5.0;
-    config.line_joints = GizmoLineJoint::Round(12);
+    config.line.width = 5.0;
+    config.line.joints = GizmoLineJoint::Round(12);
     config.enabled = true;
+    config.render_layers = RenderLayers::layer(GIZMO_RENDER_LAYER);
 }
 
 fn render_vector_arrow(
     entity_map: Res<EntityMap>,
-    query: Query<(Option<&Transform>, &ComponentValueMap)>,
-    arrows: Query<&VectorArrow>,
+    vector_arrows: Query<(&VectorArrow3d, &VectorArrowState)>,
+    component_values: Query<&'static WktComponentValue>,
+    floating_origin: Res<FloatingOriginSettings>,
     mut gizmos: Gizmos,
 ) {
-    for gizmo in arrows.iter() {
-        let VectorArrow {
-            id,
-            color,
-            range,
-            attached,
-            entity_id,
-            body_frame,
-            scale,
-        } = gizmo;
-
-        let Some(entity_id) = entity_map.get(entity_id) else {
+    for (arrow, state) in vector_arrows.iter() {
+        let Some(vector_expr) = &state.vector_expr else {
             continue;
         };
 
-        let Ok((transform, values)) = query.get(*entity_id) else {
+        let Ok(vector_value) = vector_expr.execute(&entity_map, &component_values) else {
             continue;
         };
 
-        let Some(value) = values.0.get(id) else {
+        let Some(mut direction) = component_value_tail_to_vec3(&vector_value) else {
             continue;
         };
-        let vec = match value {
-            impeller::ComponentValue::F32(arr) => Vector3::new(
-                arr[range.start] as f64,
-                arr[range.start + 1] as f64,
-                arr[range.start + 2] as f64,
-            ),
-            impeller::ComponentValue::F64(arr) => {
-                Vector3::new(arr[range.start], arr[range.start + 1], arr[range.start + 2])
-            }
-            _ => {
-                continue;
-            }
-        };
-        let vec = WorldPos {
-            att: Quaternion::identity(),
-            pos: vec,
+
+        if direction.length_squared() <= MIN_ARROW_LENGTH_SQUARED {
+            continue;
         }
-        .bevy_pos()
-        .as_vec3();
-        let (start, end) = if *attached {
-            let Some(attached_transform) = transform else {
+
+        if arrow.normalize {
+            direction = direction.normalize();
+        }
+
+        direction *= arrow.scale;
+        if direction.length_squared() <= MIN_ARROW_LENGTH_SQUARED {
+            continue;
+        }
+
+        let mut start_world = DVec3::ZERO;
+        let mut rotation = DQuat::IDENTITY;
+        if let Some(origin_expr) = &state.origin_expr {
+            let Ok(origin_value) = origin_expr.execute(&entity_map, &component_values) else {
                 continue;
             };
-            let end = if *body_frame {
-                attached_transform.translation + attached_transform.rotation * vec * *scale
-            } else {
-                attached_transform.translation + vec * *scale
-            };
-            (attached_transform.translation, end)
-        } else if *body_frame {
-            let Some(attached_transform) = transform else {
-                continue;
-            };
-            (Vec3::ZERO, attached_transform.rotation * vec * *scale)
-        } else {
-            (Vec3::ZERO, vec * *scale)
-        };
-        gizmos.arrow(start, end, *color);
+            if let Some(world_pos) = origin_value.as_world_pos() {
+                start_world = world_pos.bevy_pos();
+                rotation = world_pos.bevy_att();
+            } else if let Some(origin) = component_value_tail_to_vec3(&origin_value) {
+                start_world = origin;
+            }
+        }
+
+        if arrow.body_frame {
+            direction = rotation * direction;
+        }
+
+        let (_, start) = floating_origin.translation_to_grid::<i128>(start_world);
+
+        let (_, end) = floating_origin.translation_to_grid::<i128>(start_world + direction);
+        gizmos.arrow(start, end, wkt_color_to_bevy(&arrow.color));
     }
 }
 
@@ -109,8 +114,8 @@ fn render_body_axis(
     for gizmo in arrows.iter() {
         let BodyAxes { entity_id, scale } = gizmo;
 
-        let Some(entity_id) = entity_map.get(entity_id) else {
-            println!("entity not found");
+        let Some(entity_id) = entity_map.get(&ComponentId(entity_id.0)) else {
+            warn!("body axes entity {entity_id:?} not found in EntityMap");
             continue;
         };
 
@@ -119,4 +124,8 @@ fn render_body_axis(
         };
         gizmos.axes(transform, *scale)
     }
+}
+
+fn wkt_color_to_bevy(color: &WktColor) -> Color {
+    Color::srgba(color.r, color.g, color.b, color.a)
 }

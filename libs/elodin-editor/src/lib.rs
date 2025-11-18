@@ -18,8 +18,8 @@ use bevy::{
     winit::WinitSettings,
 };
 use bevy_egui::{EguiContextSettings, EguiPlugin};
+use bevy_render::alpha::AlphaMode;
 use big_space::{FloatingOrigin, FloatingOriginSettings, GridCell};
-use convert_case::{Case, Casing};
 use impeller2::types::{ComponentId, OwnedPacket};
 use impeller2::types::{Msg, Timestamp};
 use impeller2_bevy::{
@@ -30,13 +30,14 @@ use impeller2_wkt::{CurrentTimestamp, NewConnection, Object3D, SetStreamState, W
 use impeller2_wkt::{EarliestTimestamp, LastUpdated};
 use nox::Tensor;
 use object_3d::create_object_3d_entity;
+use plugins::gizmos::GizmoPlugin;
 use plugins::navigation_gizmo::{NavigationGizmoPlugin, RenderLayerAlloc};
 use ui::{
     SelectedObject,
     colors::{ColorExt, get_scheme},
     inspector::viewport::set_viewport_pos,
     plot::{CollectedGraphData, gpu::LineHandle},
-    tiles::{self, TileState},
+    tiles,
     utils::FriendlyEpoch,
 };
 
@@ -44,6 +45,7 @@ pub mod object_3d;
 mod offset_parse;
 mod plugins;
 pub mod ui;
+pub mod vector_arrow;
 
 #[cfg(not(target_family = "wasm"))]
 pub mod run;
@@ -94,6 +96,10 @@ pub struct EditorPlugin {
     window_resolution: WindowResolution,
 }
 
+/// The positions of camera of object_3d are sync'd in `PreUpdate`.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PositionSync;
+
 impl EditorPlugin {
     pub fn new(width: f32, height: f32) -> Self {
         Self {
@@ -128,8 +134,9 @@ impl Plugin for EditorPlugin {
             WinitSettings::game()
         };
         app
-            //.insert_resource(AssetMetaCheck::Never)
+            // .insert_resource(AssetMetaCheck::Never)
             .add_plugins(plugins::WebAssetPlugin)
+            .add_plugins(plugins::env_asset_source::plugin)
             .add_plugins(
                 DefaultPlugins
                     .set(WindowPlugin {
@@ -154,7 +161,8 @@ impl Plugin for EditorPlugin {
                     })
                     .set(AssetPlugin {
                         unapproved_path_mode: UnapprovedPathMode::Allow,
-                        mode: AssetMode::Processed,
+                        // NOTE: `Processed` interferes with WebAssetPlugin.
+                        // mode: AssetMode::Processed,
                         ..default()
                     })
                     .disable::<TransformPlugin>()
@@ -166,8 +174,8 @@ impl Plugin for EditorPlugin {
             .init_resource::<tiles::ViewportContainsPointer>()
             .add_plugins(bevy_framepace::FramepacePlugin)
             //.add_plugins(DefaultPickingPlugins)
-            .add_plugins(big_space::FloatingOriginPlugin::<i128>::new(16_000., 100.))
             .add_plugins(bevy_editor_cam::DefaultEditorCamPlugins)
+            .add_plugins(big_space::FloatingOriginPlugin::<i128>::new(16_000., 100.))
             .add_plugins(EmbeddedAssetPlugin)
             .add_plugins(EguiPlugin {
                 enable_multipass_for_primary_context: false,
@@ -175,7 +183,7 @@ impl Plugin for EditorPlugin {
             .add_plugins(bevy_infinite_grid::InfiniteGridPlugin)
             .add_plugins(NavigationGizmoPlugin)
             .add_plugins(impeller2_bevy::Impeller2Plugin)
-            //.add_plugins(crate::plugins::gizmos::GizmoPlugin)
+            .add_plugins(GizmoPlugin)
             .add_plugins(ui::UiPlugin)
             .add_plugins(FrameTimeDiagnosticsPlugin::default())
             .add_plugins(WireframePlugin::default())
@@ -191,17 +199,22 @@ impl Plugin for EditorPlugin {
             .add_systems(PreUpdate, setup_cell)
             .add_systems(PreUpdate, sync_res::<CurrentTimestamp>)
             .add_systems(PreUpdate, sync_res::<impeller2_wkt::SimulationTimeStep>)
-            .add_systems(PreUpdate, sync_pos)
-            .add_systems(PreUpdate, sync_object_3d)
+            .add_systems(
+                PreUpdate,
+                (
+                    set_floating_origin,
+                    (sync_pos, sync_object_3d, set_viewport_pos),
+                )
+                    .chain()
+                    .in_set(PositionSync),
+            )
             .add_systems(Update, sync_paused)
             .add_systems(PreUpdate, set_selected_range)
-            .add_systems(PreUpdate, set_floating_origin.after(sync_pos))
-            .add_systems(PreUpdate, update_eql_context)
-            .add_systems(PreUpdate, set_eql_context_range.after(update_eql_context))
+            .add_systems(Update, update_eql_context)
+            .add_systems(Update, set_eql_context_range.after(update_eql_context))
             .add_systems(Startup, spawn_ui_cam)
             .add_systems(PostUpdate, ui::video_stream::set_visibility)
             .add_systems(PostUpdate, set_clear_color)
-            .add_systems(Update, set_viewport_pos)
             //.add_systems(Update, clamp_current_time)
             .insert_resource(WireframeConfig {
                 global: false,
@@ -217,11 +230,17 @@ impl Plugin for EditorPlugin {
             app.add_systems(Update, handle_drag_resize);
         }
 
+        #[cfg(feature = "debug")]
+        app.add_plugins(big_space::debug::FloatingOriginDebugPlugin::<i128>::default());
+
         #[cfg(not(target_family = "wasm"))]
         app.add_plugins(crate::ui::startup_window::StartupPlugin);
 
         #[cfg(target_os = "macos")]
         app.add_systems(Update, setup_titlebar);
+
+        #[cfg(feature = "inspector")]
+        app.add_plugins(bevy_inspector_egui::quick::WorldInspectorPlugin::new());
 
         // For adding features incompatible with wasm:
         embedded_asset!(app, "./assets/diffuse.ktx2");
@@ -229,6 +248,10 @@ impl Plugin for EditorPlugin {
         if cfg!(not(target_arch = "wasm32")) {
             app.insert_resource(DirectionalLightShadowMap { size: 8192 });
         }
+        app.configure_sets(
+            PreUpdate,
+            PositionSync.before(bevy_editor_cam::SyncCameraPosition),
+        );
     }
 }
 
@@ -322,20 +345,9 @@ fn setup_titlebar(
     winit_windows: NonSend<bevy::winit::WinitWindows>,
     mut commands: Commands,
 ) {
-    use cocoa::{
-        appkit::{
-            NSColor, NSToolbar, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
-            NSWindowToolbarStyle,
-        },
-        base::{BOOL, id, nil},
-    };
-    use objc::{
-        class,
-        declare::ClassDecl,
-        msg_send,
-        runtime::{Object, Sel},
-        sel, sel_impl,
-    };
+    use objc2::rc::Retained;
+    use objc2::{ClassType, msg_send, msg_send_id};
+    use objc2_app_kit::{NSColor, NSToolbar, NSWindow, NSWindowStyleMask, NSWindowToolbarStyle};
 
     for id in &windows {
         let Some(window) = winit_windows.get_window(id) else {
@@ -348,68 +360,44 @@ fn setup_titlebar(
             error!("non AppKit window on macOS");
             continue;
         };
-        let window = handle.ns_window;
-        let window: cocoa::base::id = unsafe { std::mem::transmute(window) };
+        let window: *mut NSWindow = handle.ns_window.cast();
         if window.is_null() {
             continue;
         }
         unsafe {
-            // define an objective class for NSToolbar's delegate,
-            // because NSToolbar will complain if we do not
-            let toolbar_delegate_class = {
-                let superclass = class!(NSObject);
-                let Some(mut decl) = ClassDecl::new(&format!("ToolbarDel{}", id), superclass)
-                else {
-                    continue;
-                };
-                extern "C" fn toolbar(_: &Object, _: Sel, _: id, _: id, _: BOOL) -> *const Object {
-                    nil
-                }
-                extern "C" fn allowed(_: &Object, _: Sel, _: id) -> id {
-                    nil
-                }
-                decl.add_method(
-                    objc::sel!(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:),
-                    toolbar as extern "C" fn(&Object, Sel, id, id, bool) -> *const Object,
-                );
-                decl.add_method(
-                    objc::sel!(toolbarAllowedItemIdentifiers:),
-                    allowed as extern "C" fn(&Object, Sel, id) -> id,
-                );
-                decl.add_method(
-                    objc::sel!(toolbarDefaultItemIdentifiers:),
-                    allowed as extern "C" fn(&Object, Sel, id) -> id,
-                );
-                decl.register()
-            };
-            let del: id = msg_send![toolbar_delegate_class, alloc];
-            let del = msg_send![del, init];
-            let toolbar = NSToolbar::alloc(nil);
-            let toolbar = toolbar.init_();
-            toolbar.setDelegate_(del);
-            if toolbar.is_null() {
-                continue;
-            }
-            window.setTitlebarAppearsTransparent_(true);
-            let color = NSColor::clearColor(nil);
-            window.setBackgroundColor_(NSColor::colorWithRed_green_blue_alpha_(
-                color,
-                (0x0C / 0xFF) as f64,
-                (0x0C / 0xFF) as f64,
-                (0x0C / 0xFF) as f64,
+            let window = &*window;
+
+            // Create a simple toolbar without delegate for now
+            // The delegate isn't strictly necessary for basic toolbar functionality
+            use objc2_foundation::NSString;
+            let identifier = NSString::from_str("MainToolbar");
+            let toolbar: Retained<NSToolbar> = msg_send_id![
+                msg_send_id![NSToolbar::class(), alloc],
+                initWithIdentifier: &*identifier
+            ];
+
+            window.setTitlebarAppearsTransparent(true);
+
+            // Create color with RGBA
+            let color = NSColor::colorWithRed_green_blue_alpha(
+                (0x0C as f64) / (0xFF as f64),
+                (0x0C as f64) / (0xFF as f64),
+                (0x0C as f64) / (0xFF as f64),
                 0.7,
-            ));
-            window.setStyleMask_(
-                NSWindowStyleMask::NSFullSizeContentViewWindowMask
-                    | NSWindowStyleMask::NSResizableWindowMask
-                    | NSWindowStyleMask::NSTitledWindowMask
-                    | NSWindowStyleMask::NSClosableWindowMask
-                    | NSWindowStyleMask::NSMiniaturizableWindowMask
-                    | NSWindowStyleMask::NSUnifiedTitleAndToolbarWindowMask,
             );
-            window.setToolbarStyle_(NSWindowToolbarStyle::NSWindowToolbarStyleUnifiedCompact);
-            window.setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleHidden);
-            window.setToolbar_(toolbar);
+            window.setBackgroundColor(Some(&color));
+
+            window.setStyleMask(
+                NSWindowStyleMask::FullSizeContentView
+                    | NSWindowStyleMask::Resizable
+                    | NSWindowStyleMask::Titled
+                    | NSWindowStyleMask::Closable
+                    | NSWindowStyleMask::Miniaturizable
+                    | NSWindowStyleMask::UnifiedTitleAndToolbar,
+            );
+            window.setToolbarStyle(NSWindowToolbarStyle::UnifiedCompact);
+            let _: () = msg_send![window, setTitleVisibility: 1u64]; // NSWindowTitleHidden = 1
+            window.setToolbar(Some(&toolbar));
             commands.entity(id).insert(SetupTitlebar);
         }
     }
@@ -572,30 +560,29 @@ fn set_icon_windows() {
 /// source: https://github.com/emilk/egui/blob/15370bbea0b468cf719a75cc6d1e39eb00c420d8/crates/eframe/src/native/app_icon.rs#L199C1-L268C2
 #[cfg(target_os = "macos")]
 fn set_icon_mac() {
-    use cocoa::{
-        appkit::{NSApp, NSApplication, NSImage},
-        base::nil,
-        foundation::NSData,
-    };
+    use objc2::rc::Retained;
+    use objc2::{ClassType, msg_send, msg_send_id};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
 
     let png_bytes = include_bytes!("../assets/512x512@2x.png");
 
-    // SAFETY: Accessing raw data from icon in a read-only manner. Icon data is static!
     unsafe {
-        let app = NSApp();
+        // Get unowned reference to shared app singleton (+0 retain count)
+        // Do NOT wrap in Retained - sharedApplication returns a non-owning reference
+        let app: *mut NSApplication = msg_send![NSApplication::class(), sharedApplication];
         if app.is_null() {
-            panic!("NSApp was null when setting app icon")
+            return;
         }
 
-        let data = NSData::dataWithBytes_length_(
-            nil,
-            png_bytes.as_ptr().cast::<std::ffi::c_void>(),
-            png_bytes.len() as u64,
-        );
+        // Create NSData from bytes
+        let data = NSData::with_bytes(png_bytes);
 
-        let app_icon = NSImage::initWithData_(NSImage::alloc(nil), data);
+        // Create NSImage from NSData (this is +1, owned by Retained)
+        let app_icon: Retained<NSImage> = msg_send_id![NSImage::alloc(), initWithData: &*data];
 
-        app.setApplicationIconImage_(app_icon);
+        // Set the icon using the unowned app pointer
+        let _: () = msg_send![app, setApplicationIconImage: &*app_icon];
     }
 }
 
@@ -652,6 +639,7 @@ pub fn sync_pos(
     mut query: Query<(&mut Transform, &mut GridCell<i128>, &WorldPos)>,
     floating_origin: Res<FloatingOriginSettings>,
 ) {
+    // return;
     query
         .iter_mut()
         .for_each(|(mut transform, mut grid_cell, world_pos)| {
@@ -686,6 +674,12 @@ impl BevyExt for impeller2_wkt::Mesh {
             impeller2_wkt::Mesh::Cylinder { radius, height } => {
                 bevy::math::primitives::Cylinder::new(radius, height).into()
             }
+            impeller2_wkt::Mesh::Plane { width, depth } => {
+                bevy::math::primitives::Plane3d::default()
+                    .mesh()
+                    .size(width, depth)
+                    .into()
+            }
         }
     }
 }
@@ -694,8 +688,21 @@ impl BevyExt for impeller2_wkt::Material {
     type Bevy = StandardMaterial;
 
     fn into_bevy(self) -> Self::Bevy {
+        let base_color = Color::srgba(
+            self.base_color.r,
+            self.base_color.g,
+            self.base_color.b,
+            self.base_color.a,
+        );
+        let alpha_mode = if self.base_color.a < 1.0 {
+            AlphaMode::Blend
+        } else {
+            AlphaMode::Opaque
+        };
+
         bevy::prelude::StandardMaterial {
-            base_color: Color::srgb(self.base_color.r, self.base_color.g, self.base_color.b),
+            base_color,
+            alpha_mode,
             ..Default::default()
         }
     }
@@ -756,7 +763,7 @@ fn sync_object_3d(
             _ => continue,
         };
 
-        let eql = format!("{}.world_pos", parent.name.to_case(Case::Snake));
+        let eql = format!("{}.world_pos", &parent.name);
         let Ok(expr) = ctx.0.parse_str(&eql) else {
             continue;
         };
@@ -769,6 +776,7 @@ fn sync_object_3d(
                 aux: (),
             },
             expr,
+            &ctx.0,
             &mut material_assets,
             &mut mesh_assets,
             &assets,
@@ -792,7 +800,7 @@ pub fn setup_clear_state(mut packet_handlers: ResMut<PacketHandlers>, mut comman
 fn clear_state_new_connection(
     PacketHandlerInput { packet, .. }: PacketHandlerInput,
     mut entity_map: ResMut<EntityMap>,
-    mut ui_state: ResMut<TileState>,
+    mut windows: ResMut<tiles::WindowManager>,
     mut selected_object: ResMut<SelectedObject>,
     mut render_layer_alloc: ResMut<RenderLayerAlloc>,
     mut value_map: Query<&mut ComponentValueMap>,
@@ -822,7 +830,18 @@ fn clear_state_new_connection(
         }
     }
     synced_glbs.0.clear();
-    ui_state.clear(&mut commands, &mut selected_object);
+    windows
+        .main_mut()
+        .clear(&mut commands, &mut selected_object);
+    for secondary in windows.take_secondary() {
+        for graph in secondary.graph_entities {
+            commands.entity(graph).despawn();
+        }
+        if let Some(entity) = secondary.window_entity {
+            commands.entity(entity).despawn();
+        }
+    }
+    windows.replace_secondary(Vec::new());
     *graph_data = CollectedGraphData::default();
     render_layer_alloc.free_all();
 }
@@ -841,13 +860,31 @@ pub fn set_selected_range(
     latest: Res<LastUpdated>,
     behavior: Res<TimeRangeBehavior>,
 ) {
-    selected_range.0 = behavior.calculate_selected_range(earliest.0, latest.0);
+    match behavior.calculate_selected_range(earliest.0, latest.0) {
+        Ok(range) => {
+            selected_range.0 = range;
+        }
+        Err(TimeRangeError::NoData) => {
+            // Nothing to do yet; keep previous selection until we have a valid dataset.
+        }
+        Err(TimeRangeError::InvalidRange { start, end }) => {
+            bevy::log::warn!(
+                "Time range selection skipped because start ({start:?}) is not before end ({end:?})"
+            );
+        }
+    }
 }
 
 #[derive(Resource, PartialEq, Eq, Clone, Copy)]
 pub struct TimeRangeBehavior {
     start: Offset,
     end: Offset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeRangeError {
+    NoData,
+    InvalidRange { start: Timestamp, end: Timestamp },
 }
 
 #[derive(Resource, PartialEq, Eq, Clone, Copy, Debug)]
@@ -925,34 +962,90 @@ impl TimeRangeBehavior {
         }
     }
 
-    fn calculate_selected_range(&self, earliest: Timestamp, latest: Timestamp) -> Range<Timestamp> {
-        let start = match self.start {
-            Offset::Earliest(duration) => earliest + duration,
-            Offset::Latest(duration) => latest - duration,
-            Offset::Fixed(timestamp) => timestamp,
-        };
-        let end = match self.end {
-            Offset::Earliest(duration) => earliest + duration,
-            Offset::Latest(duration) => latest - duration,
-            Offset::Fixed(timestamp) => timestamp,
-        };
+    fn calculate_selected_range(
+        &self,
+        earliest: Timestamp,
+        latest: Timestamp,
+    ) -> Result<Range<Timestamp>, TimeRangeError> {
+        if earliest >= latest {
+            return Err(TimeRangeError::NoData);
+        }
 
-        clamp_range(earliest..latest, start..end)
+        let start = self.start.resolve(earliest, latest);
+        let end = self.end.resolve(earliest, latest);
+
+        if start >= end {
+            return Err(TimeRangeError::InvalidRange { start, end });
+        }
+
+        let clamped = clamp_range(earliest..latest, start..end);
+        if clamped.start >= clamped.end {
+            return Err(TimeRangeError::InvalidRange {
+                start: clamped.start,
+                end: clamped.end,
+            });
+        }
+
+        Ok(clamped)
     }
 
     pub fn is_subset(&self, earliest: Timestamp, latest: Timestamp) -> bool {
-        let start = match self.start {
-            Offset::Earliest(duration) => earliest + duration,
-            Offset::Latest(duration) => latest - duration,
-            Offset::Fixed(timestamp) => timestamp,
-        };
-        let end = match self.end {
-            Offset::Earliest(duration) => earliest + duration,
-            Offset::Latest(duration) => latest - duration,
-            Offset::Fixed(timestamp) => timestamp,
-        };
+        let start = self.start.resolve(earliest, latest);
+        let end = self.end.resolve(earliest, latest);
         let full_range = earliest..=latest;
         full_range.contains(&start) && full_range.contains(&end)
+    }
+}
+
+impl Offset {
+    pub(crate) fn resolve(&self, earliest: Timestamp, latest: Timestamp) -> Timestamp {
+        match self {
+            Offset::Earliest(duration) => earliest + *duration,
+            Offset::Latest(duration) => latest - *duration,
+            Offset::Fixed(timestamp) => *timestamp,
+        }
+    }
+}
+
+#[cfg(test)]
+mod time_range_tests {
+    use super::*;
+
+    fn timestamp_secs(sec: i64) -> Timestamp {
+        Timestamp(sec * 1_000_000)
+    }
+
+    #[test]
+    fn calculate_selected_range_accepts_valid_bounds() {
+        let behavior = TimeRangeBehavior::FULL;
+        let earliest = timestamp_secs(0);
+        let latest = timestamp_secs(10);
+
+        let result = behavior.calculate_selected_range(earliest, latest);
+        assert!(matches!(result, Ok(ref range) if range.start == earliest && range.end == latest));
+    }
+
+    #[test]
+    fn calculate_selected_range_rejects_inverted_bounds() {
+        let behavior = TimeRangeBehavior {
+            start: Offset::Earliest(Duration::from_secs(10)),
+            end: Offset::Latest(Duration::ZERO),
+        };
+        let earliest = timestamp_secs(0);
+        let latest = timestamp_secs(5);
+
+        let result = behavior.calculate_selected_range(earliest, latest);
+        assert!(matches!(result, Err(TimeRangeError::InvalidRange { .. })));
+    }
+
+    #[test]
+    fn calculate_selected_range_handles_no_data() {
+        let behavior = TimeRangeBehavior::FULL;
+        let earliest = timestamp_secs(0);
+        let latest = timestamp_secs(0);
+
+        let result = behavior.calculate_selected_range(earliest, latest);
+        assert!(matches!(result, Err(TimeRangeError::NoData)));
     }
 }
 
@@ -977,18 +1070,8 @@ pub fn clamp_current_time(
     }
 }
 
-#[derive(Resource)]
+#[derive(Default, Resource)]
 pub struct EqlContext(pub eql::Context);
-
-impl Default for EqlContext {
-    fn default() -> Self {
-        Self(eql::Context::new(
-            HashMap::new(),
-            Timestamp(i64::MIN),
-            Timestamp(i64::MAX),
-        ))
-    }
-}
 
 pub fn update_eql_context(
     component_metadata_registry: Res<ComponentMetadataRegistry>,
@@ -996,6 +1079,9 @@ pub fn update_eql_context(
     path_reg: Res<ComponentPathRegistry>,
     mut eql_context: ResMut<EqlContext>,
 ) {
+    if path_reg.0.is_empty() {
+        return;
+    };
     eql_context.0 = eql::Context::from_leaves(
         path_reg.0.iter().filter_map(|(id, path)| {
             let schema = component_schema_registry.0.get(id)?;

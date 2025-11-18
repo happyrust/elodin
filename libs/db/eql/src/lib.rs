@@ -1,7 +1,7 @@
-use convert_case::Casing;
+#![doc = include_str!("../README.md")]
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     str::FromStr,
     sync::Arc,
 };
@@ -13,6 +13,10 @@ use impeller2::{
 };
 use impeller2_wkt::ComponentPath;
 use peg::error::ParseError;
+
+pub mod formulas;
+
+use formulas::{Formula, FormulaRegistry, create_default_registry};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AstNode<'input> {
@@ -105,9 +109,7 @@ pub enum Expr {
     FloatLiteral(f64),
     StringLiteral(String),
 
-    // ffts
-    Fft(Box<Expr>),
-    FftFreq(Box<Expr>),
+    Formula(Arc<dyn Formula>, Box<Expr>),
 
     // time limits
     Last(Box<Expr>, hifitime::Duration),
@@ -121,10 +123,8 @@ impl Expr {
     fn to_field(&self) -> Result<String, Error> {
         match self {
             Expr::ComponentPart(component) => Ok(component.name.replace(".", "_")),
-
             Expr::Time(_) => Ok("time".to_string()),
-            Expr::Fft(e) => Ok(format!("fft({})", e.to_field()?)),
-            Expr::FftFreq(e) => Ok(format!("fftfreq({})", e.to_field()?)),
+            Expr::Formula(formula, expr) => formula.to_field(expr),
             Expr::BinaryOp(left, right, op) => Ok(format!(
                 "({} {} {})",
                 left.to_field()?,
@@ -153,8 +153,7 @@ impl Expr {
             Expr::ComponentPart(component) => Ok(component.name.replace(".", "_")),
 
             Expr::Time(component) => Ok(component.name.replace(".", "_")),
-            Expr::FftFreq(e) => e.to_table(),
-            Expr::Fft(e) => e.to_table(),
+            Expr::Formula(_, expr) => expr.to_table(),
             Expr::BinaryOp(left, _, _) => left.to_table(),
 
             Expr::ArrayAccess(inner_expr, _) => match inner_expr.as_ref() {
@@ -173,8 +172,7 @@ impl Expr {
     /// Converts an Expr to a qualified SQL field name (table.field) for use in JOINs.
     fn to_qualified_field(&self) -> Result<String, Error> {
         match self {
-            Expr::Fft(e) => Ok(format!("fft({})", e.to_qualified_field()?)),
-            Expr::FftFreq(e) => Ok(format!("fftfreq({})", e.to_qualified_field()?)),
+            Expr::Formula(formula, expr) => formula.to_qualified_field(expr),
             Expr::BinaryOp(left, right, op) => Ok(format!(
                 "({} {} {})",
                 left.to_qualified_field()?,
@@ -192,8 +190,7 @@ impl Expr {
 
     fn to_column_name(&self) -> Option<String> {
         match self {
-            Expr::Fft(e) => Some(format!("fft({})", e.to_column_name()?)),
-            Expr::FftFreq(e) => Some(format!("fftfreq({})", e.to_column_name()?)),
+            Expr::Formula(formula, expr) => formula.to_column_name(expr),
             Expr::ComponentPart(e) => Some(e.name.clone()),
             Expr::ArrayAccess(expr, index) => match expr.as_ref() {
                 Expr::ComponentPart(c) => {
@@ -223,7 +220,7 @@ impl Expr {
         }
     }
 
-    fn to_sql_time_field(&self) -> Result<String, Error> {
+    pub(crate) fn to_sql_time_field(&self) -> Result<String, Error> {
         match self {
             Expr::Tuple(elements) => {
                 let Some(first) = elements.first() else {
@@ -307,31 +304,10 @@ impl Expr {
                 }
             }
 
-            Expr::Last(expr, duration) => {
-                let sql = expr.to_sql(context)?;
-                let duration_micros = (duration.total_nanoseconds() / 1000) as i64;
-                let lower_bound = context.last_timestamp.0 - duration_micros;
-                let lower_bound = lower_bound as f64 * 1e-6;
-                let time_field = expr.to_sql_time_field()?;
-                Ok(format!(
-                    "{sql} where {time_field} >= to_timestamp({lower_bound})",
-                ))
-            }
-            Expr::First(expr, duration) => {
-                let sql = expr.to_sql(context)?;
-                let duration_micros = (duration.total_nanoseconds() / 1000) as i64;
-                let upper_bound = context.earliest_timestamp.0 + duration_micros;
-                let upper_bound = upper_bound as f64 * 1e-6;
-                let time_field = expr.to_sql_time_field()?;
-                Ok(format!(
-                    "{sql} where {time_field} <= to_timestamp({upper_bound})",
-                ))
-            }
-
             Expr::StringLiteral(_) => Err(Error::InvalidFieldAccess(
                 "cannot convert string literal to SQL".to_string(),
             )),
-
+            Expr::Formula(formula, expr) => formula.to_sql(expr, context),
             expr => Ok(format!(
                 "select {} from {}",
                 expr.to_select_part()?,
@@ -351,7 +327,7 @@ pub struct ComponentPart {
     pub name: String,
     pub id: ComponentId,
     pub component: Option<Arc<Component>>,
-    pub children: HashMap<String, ComponentPart>,
+    pub children: BTreeMap<String, ComponentPart>,
 }
 
 #[derive(Clone, Debug)]
@@ -396,18 +372,21 @@ fn default_element_names(shape: &[u64]) -> Vec<String> {
     elems
 }
 
+#[derive(Debug)]
 pub struct Context {
-    pub component_parts: HashMap<String, ComponentPart>,
+    pub component_parts: BTreeMap<String, ComponentPart>,
     pub earliest_timestamp: Timestamp,
     pub last_timestamp: Timestamp,
+    pub formula_registry: FormulaRegistry,
 }
 
 impl Default for Context {
     fn default() -> Self {
         Context {
-            component_parts: HashMap::new(),
+            component_parts: BTreeMap::new(),
             earliest_timestamp: Timestamp(i64::MIN),
             last_timestamp: Timestamp(i64::MAX),
+            formula_registry: create_default_registry(),
         }
     }
 }
@@ -418,7 +397,7 @@ impl Context {
         earliest_timestamp: Timestamp,
         last_timestamp: Timestamp,
     ) -> Self {
-        let mut component_parts = HashMap::new();
+        let mut component_parts = BTreeMap::new();
         for component in components.into_iter() {
             let path = ComponentPath::from_name(&component.name);
             let nodes = component.name.split('.');
@@ -429,40 +408,38 @@ impl Context {
                 .zip(nodes)
                 .take(path.path.len().saturating_sub(1))
             {
-                let part = component_parts
-                    .entry(node.to_case(convert_case::Case::Snake))
-                    .or_insert_with(|| ComponentPart {
-                        id: part.id,
-                        name: part.name.to_string(),
-                        children: HashMap::new(),
-                        component: None,
-                    });
+                let part =
+                    component_parts
+                        .entry(node.to_string())
+                        .or_insert_with(|| ComponentPart {
+                            id: part.id,
+                            name: part.name.to_string(),
+                            children: BTreeMap::new(),
+                            component: None,
+                        });
                 component_parts = &mut part.children;
             }
-            let nodes = component.name.split('.');
+            let mut nodes = component.name.split('.');
             component_parts.insert(
-                nodes.last().unwrap().to_case(convert_case::Case::Snake),
+                nodes.next_back().unwrap().to_string(),
                 ComponentPart {
                     id: component.id,
                     name: component.name.clone(),
-                    children: HashMap::new(),
+                    children: BTreeMap::new(),
                     component: Some(component),
                 },
             );
         }
-        // let mut component_parts = HashMap::new();
-        // for component in components {
-        //     component_parts.insert(component.name.clone(), component);
-        // }
         Self {
             component_parts,
             earliest_timestamp,
             last_timestamp,
+            formula_registry: create_default_registry(),
         }
     }
 
     pub fn new(
-        component_parts: HashMap<String, ComponentPart>,
+        component_parts: BTreeMap<String, ComponentPart>,
         earliest_timestamp: Timestamp,
         last_timestamp: Timestamp,
     ) -> Self {
@@ -470,6 +447,7 @@ impl Context {
             component_parts,
             earliest_timestamp,
             last_timestamp,
+            formula_registry: create_default_registry(),
         }
     }
 
@@ -525,16 +503,10 @@ impl Context {
                     .iter()
                     .map(|ast_node| self.parse(ast_node))
                     .collect::<Result<Vec<_>, _>>()?;
-                match (cow.as_ref(), &recv, &args[..]) {
-                    ("fft", Expr::ArrayAccess(_, _), &[]) => Ok(Expr::Fft(Box::new(recv))),
-                    ("fftfreq", Expr::Time(_), &[]) => Ok(Expr::FftFreq(Box::new(recv))),
-                    ("last", _, &[Expr::StringLiteral(ref d)]) => {
-                        Ok(Expr::Last(Box::new(recv), parse_duration(d)?))
-                    }
-                    ("first", _, &[Expr::StringLiteral(ref d)]) => {
-                        Ok(Expr::First(Box::new(recv), parse_duration(d)?))
-                    }
-                    _ => Err(Error::InvalidMethodCall(cow.to_string())),
+                if let Some(formula) = self.formula_registry.get(cow.as_ref()) {
+                    formula.parse(recv, &args)
+                } else {
+                    Err(Error::InvalidMethodCall(cow.to_string()))
                 }
             }
             AstNode::Tuple(ast_nodes) => ast_nodes
@@ -542,11 +514,7 @@ impl Context {
                 .map(|ast_node| self.parse(ast_node))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Expr::Tuple),
-            AstNode::StringLiteral(s) => {
-                Ok(Expr::StringLiteral(s.to_string()))
-                // // Parse duration strings like "5m", "10s", "1h"
-                // self.parse_duration(s.as_ref()).map(Expr::DurationLiteral)
-            }
+            AstNode::StringLiteral(s) => Ok(Expr::StringLiteral(s.to_string())),
             AstNode::BinaryOp(left, right, op) => {
                 let left = self.parse(left)?;
                 let right = self.parse(right)?;
@@ -580,42 +548,26 @@ impl Context {
 
     /// Get suggestions for the given expression
     pub fn get_suggestions(&self, expr: &Expr) -> Vec<String> {
-        match expr {
+        let mut suggestions: Vec<String> = match expr {
             Expr::ComponentPart(part) => {
                 let mut suggestions: Vec<String> = part.children.keys().cloned().collect();
                 if let Some(component) = &part.component {
                     suggestions.extend(component.element_names.iter().map(|name| name.to_string()));
-                    suggestions.push("last(".to_string());
-                    suggestions.push("first(".to_string());
                 }
                 suggestions.push("time".to_string());
-                suggestions.sort();
                 suggestions
             }
-            Expr::Time(_) => {
-                vec!["fftfreq()".to_string()]
-            }
-            Expr::ArrayAccess(_, _) => {
-                vec![
-                    "fft()".to_string(),
-                    "last(".to_string(),
-                    "first(".to_string(),
-                ]
-            }
-            Expr::Tuple(_) => {
-                vec!["last".to_string(), "first".to_string()]
-            }
-            Expr::StringLiteral(_) => {
-                vec![]
-            }
-            Expr::Fft(_) => {
-                vec!["last".to_string(), "first".to_string()]
-            }
-            Expr::FftFreq(_) => {
-                vec!["last".to_string(), "first".to_string()]
-            }
-            _ => vec![],
+            Expr::StringLiteral(_) => Vec::new(),
+            _ => Vec::new(),
+        };
+
+        for formula in self.formula_registry.iter() {
+            suggestions.extend(formula.suggestions(expr, self));
         }
+
+        suggestions.sort();
+        suggestions.dedup();
+        suggestions
     }
 
     pub fn get_string_suggestions(&self, input: &str) -> Vec<(String, String)> {
@@ -689,7 +641,7 @@ impl Context {
     }
 }
 
-fn parse_duration(duration_str: &str) -> Result<hifitime::Duration, Error> {
+pub(crate) fn parse_duration(duration_str: &str) -> Result<hifitime::Duration, Error> {
     let span = jiff::Span::from_str(duration_str)
         .map_err(|err| Error::InvalidMethodCall(err.to_string()))?;
     Ok(hifitime::Duration::from_nanoseconds(
@@ -709,11 +661,14 @@ pub enum Error {
     InvalidMethodCall(String),
     #[error("parse {0}")]
     Parse(#[from] ParseError<peg::str::LineCol>),
+    #[error("missing duration: {0}")]
+    MissingDuration(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formulas::*;
 
     #[test]
     fn test_ast_parse() {
@@ -810,12 +765,31 @@ mod tests {
         let context = create_test_context();
 
         let time_expr = Expr::Time(entity_component);
-        let expr = Expr::FftFreq(Box::new(time_expr));
+        let expr = Expr::Formula(Arc::new(FftFreq), Box::new(time_expr));
         let result = expr.to_sql(&context);
         assert_eq!(
             result.unwrap(),
             "select fftfreq(a_world_pos.time) from a_world_pos"
         );
+    }
+
+    #[test]
+    fn test_fft_sql_via_parse() {
+        let context = create_test_context();
+        let expr = context.parse_str("a.world_pos[0].fft()").unwrap();
+        let sql = expr.to_sql(&context).unwrap();
+        assert_eq!(
+            sql,
+            "select fft(a_world_pos.a_world_pos[1]) as 'fft(a.world_pos.x)' from a_world_pos"
+        );
+    }
+
+    #[test]
+    fn test_fftfreq_sql_via_parse() {
+        let context = create_test_context();
+        let expr = context.parse_str("a.world_pos.time.fftfreq()").unwrap();
+        let sql = expr.to_sql(&context).unwrap();
+        assert_eq!(sql, "select fftfreq(a_world_pos.time) from a_world_pos");
     }
 
     #[test]
@@ -894,7 +868,7 @@ mod tests {
             name: "b.velocity".to_string(),
             id: ComponentId::new("b.velocity"),
             component: Some(component2),
-            children: HashMap::default(),
+            children: BTreeMap::default(),
         });
 
         // Test Tuple with components from different tables
@@ -948,7 +922,7 @@ mod tests {
             name: "b.velocity".to_string(),
             id: ComponentId::new("b.velocity"),
             component: Some(component2),
-            children: HashMap::default(),
+            children: BTreeMap::default(),
         });
 
         let component3 = Arc::new(Component::new(
@@ -961,7 +935,7 @@ mod tests {
             name: "c.acceleration".to_string(),
             id: ComponentId::new("c.acceleration"),
             component: Some(component3),
-            children: HashMap::default(),
+            children: BTreeMap::default(),
         });
 
         let expr = Expr::Tuple(vec![
@@ -974,6 +948,19 @@ mod tests {
         assert_eq!(
             result_str,
             "select a_world_pos.a_world_pos as 'a.world_pos', b_velocity.b_velocity as 'b.velocity', c_acceleration.c_acceleration as 'c.acceleration' from a_world_pos JOIN b_velocity ON a_world_pos.time = b_velocity.time JOIN c_acceleration ON a_world_pos.time = c_acceleration.time"
+        );
+    }
+
+    #[test]
+    fn test_norm_sql() {
+        // norm()
+        let part = create_test_component_part();
+        let context = create_test_context();
+        let expr = Expr::Formula(Arc::new(Norm), Box::new(Expr::ComponentPart(part)));
+        let sql = expr.to_sql(&context).unwrap();
+        assert_eq!(
+            sql,
+            "select sqrt(a_world_pos.a_world_pos[1] * a_world_pos.a_world_pos[1] + a_world_pos.a_world_pos[2] * a_world_pos.a_world_pos[2] + a_world_pos.a_world_pos[3] * a_world_pos.a_world_pos[3]) as 'norm(a.world_pos)' from a_world_pos"
         );
     }
 
@@ -992,7 +979,9 @@ mod tests {
         let suggestions = context.get_suggestions(&expr);
         assert!(suggestions.contains(&"world_pos".to_string()));
         assert!(suggestions.contains(&"time".to_string()));
-        assert_eq!(suggestions.len(), 2);
+        assert!(suggestions.contains(&"first(".to_string()));
+        assert!(suggestions.contains(&"last(".to_string()));
+        assert_eq!(suggestions.len(), 4);
     }
 
     #[test]
@@ -1005,6 +994,7 @@ mod tests {
         let suggestions = context.get_suggestions(&expr);
         assert!(suggestions.contains(&"first(".to_string()));
         assert!(suggestions.contains(&"last(".to_string()));
+        assert!(suggestions.contains(&"norm()".to_string()));
         assert!(suggestions.contains(&"time".to_string()));
         assert!(suggestions.contains(&"x".to_string()));
         assert!(suggestions.contains(&"y".to_string()));
@@ -1035,6 +1025,14 @@ mod tests {
     }
 
     #[test]
+    fn test_formula_suggestions() {
+        let context = create_test_context();
+        let expr = context.parse_str("a.world_pos[0].fft()").unwrap();
+        let suggestions = context.get_suggestions(&expr);
+        assert_eq!(suggestions, vec!["first", "last"]);
+    }
+
+    #[test]
     fn test_string_suggestions_empty() {
         let context = create_test_context();
         let suggestions = context
@@ -1058,6 +1056,8 @@ mod tests {
 
         assert!(suggestions.contains(&"world_pos".to_string()));
         assert!(suggestions.contains(&"time".to_string()));
+        assert!(suggestions.contains(&"first(".to_string()));
+        assert!(suggestions.contains(&"last(".to_string()));
     }
 
     #[test]
@@ -1071,6 +1071,7 @@ mod tests {
 
         assert!(suggestions.contains(&"first(".to_string()));
         assert!(suggestions.contains(&"last(".to_string()));
+        assert!(suggestions.contains(&"norm()".to_string()));
         assert!(suggestions.contains(&"time".to_string()));
         assert!(suggestions.contains(&"x".to_string()));
     }
@@ -1112,6 +1113,20 @@ mod tests {
                 )),
                 FmtNode::String(Cow::Borrowed("test")),
             ]
+        );
+    }
+
+    #[test]
+    fn test_rocket_string() {
+        assert_eq!(
+            ast_parser::expr("rocket.fin_deflect[0]").unwrap(),
+            AstNode::ArrayIndex(
+                Box::new(AstNode::Field(
+                    Box::new(AstNode::Ident("rocket".into())),
+                    "fin_deflect".into()
+                )),
+                0
+            )
         );
     }
 }

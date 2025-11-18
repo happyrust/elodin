@@ -1,5 +1,5 @@
 use bevy::asset::Asset;
-use bevy::log::warn;
+use bevy::log::warn_once;
 use bevy::prelude::{DetectChanges, InRef, Res, ResMut};
 use bevy::reflect::TypePath;
 use bevy::{
@@ -85,13 +85,13 @@ impl PlotDataComponent {
                 })
             });
             let line = assets.get_mut(line.id()).expect("missing line asset");
-            if let Some(last) = line.data.last() {
-                if last.timestamps.len() < CHUNK_LEN {
-                    line.data.update_last(|c| {
-                        c.push(timestamp, earliest_timestamp, new_value);
-                    });
-                    continue;
-                }
+            if let Some(last) = line.data.last()
+                && last.timestamps.len() < CHUNK_LEN
+            {
+                line.data.update_last(|c| {
+                    c.push(timestamp, earliest_timestamp, new_value);
+                });
+                continue;
             }
             let new_chunk = Chunk::from_initial_value(timestamp, earliest_timestamp, new_value);
             line.data.insert(new_chunk);
@@ -136,7 +136,7 @@ pub fn pkt_handler(
             return;
         }
         if let Err(err) = table.sink(registry, &mut tick) {
-            warn!(?err, "tick sick failed");
+            warn_once!(?err, "tick sink failed");
         }
         if let Err(err) = table.sink(
             registry,
@@ -149,7 +149,7 @@ pub fn pkt_handler(
                 }
             },
         ) {
-            warn!(?err, "graph sink failed");
+            warn_once!(?err, "graph sink failed");
         }
     }
 }
@@ -406,10 +406,10 @@ pub fn queue_timestamp_read(
             .first_key_value()
             .and_then(|(_k, v)| lines.get_mut(v));
 
-        if let Some(last_queried) = line.as_ref().and_then(|l| l.last_queried.as_ref()) {
-            if last_queried.elapsed() <= Duration::from_millis(250) {
-                continue;
-            }
+        if let Some(last_queried) = line.as_ref().and_then(|l| l.last_queried.as_ref())
+            && last_queried.elapsed() <= Duration::from_millis(250)
+        {
+            continue;
         }
 
         let mut process_range = |range: Range<Timestamp>| {
@@ -498,14 +498,12 @@ fn next_range(
     component: &PlotDataComponent,
     lines: &Assets<Line>,
 ) -> Range<Timestamp> {
-    if let Some((_, line)) = component.lines.first_key_value() {
-        if let Some(line) = lines.get(line) {
-            if let Some(chunk) = line.data.range_iter(current_range.clone()).next() {
-                if chunk.summary.start_timestamp <= current_range.start {
-                    current_range.start = chunk.summary.end_timestamp;
-                }
-            }
-        }
+    if let Some((_, line)) = component.lines.first_key_value()
+        && let Some(line) = lines.get(line)
+        && let Some(chunk) = line.data.range_iter(current_range.clone()).next()
+        && chunk.summary.start_timestamp <= current_range.start
+    {
+        current_range.start = chunk.summary.end_timestamp;
     }
     current_range
 }
@@ -583,11 +581,11 @@ impl XYLine {
     }
 
     pub fn push_x_value(&mut self, value: f32) {
-        if let Some(buf) = self.x_values.last_mut() {
-            if buf.cpu().len() < CHUNK_LEN {
-                buf.push(value);
-                return;
-            }
+        if let Some(buf) = self.x_values.last_mut()
+            && buf.cpu().len() < CHUNK_LEN
+        {
+            buf.push(value);
+            return;
         }
         let mut buf = SharedBuffer::default();
         buf.push(value);
@@ -595,11 +593,11 @@ impl XYLine {
     }
 
     pub fn push_y_value(&mut self, value: f32) {
-        if let Some(buf) = self.y_values.last_mut() {
-            if buf.cpu().len() < CHUNK_LEN {
-                buf.push(value);
-                return;
-            }
+        if let Some(buf) = self.y_values.last_mut()
+            && buf.cpu().len() < CHUNK_LEN
+        {
+            buf.push(value);
+            return;
         }
         let mut buf = SharedBuffer::default();
         buf.push(value);
@@ -979,7 +977,12 @@ impl<D: Clone + BoundOrd + Immutable + IntoBytes + Debug> LineTree<D> {
             .expect("no write buf");
         let (chunk_count, index_count) = self.draw_index_count(line_visible_range.clone());
         let desired_index_len = INDEX_BUFFER_LEN.min(pixel_width * 4);
-        let step = (index_count.div_ceil(desired_index_len - 2 * chunk_count)).max(1);
+        let divisor = desired_index_len - 2 * chunk_count;
+        let step = if divisor != 0 {
+            index_count.div_ceil(divisor).max(1)
+        } else {
+            1
+        };
         let mut view = &mut view[..];
         let mut count = 0;
         for chunk in self.draw_index_chunk_iter(line_visible_range) {
@@ -1005,8 +1008,9 @@ impl<D: Clone + BoundOrd + Immutable + IntoBytes + Debug> LineTree<D> {
     }
 
     pub fn garbage_collect(&mut self, line_visible_range: Range<Timestamp>) {
-        let first_half = nodit::interval::ee(i64::MIN, line_visible_range.start.0 - 1);
-        let second_half = nodit::interval::ee(line_visible_range.end.0 + 1, i64::MAX);
+        let first_half =
+            nodit::interval::ii(i64::MIN, line_visible_range.start.0.saturating_sub(1));
+        let second_half = nodit::interval::ii(line_visible_range.end.0.saturating_add(1), i64::MAX);
         for (range, chunk) in self
             .tree
             .overlapping(first_half)
@@ -1017,20 +1021,20 @@ impl<D: Clone + BoundOrd + Immutable + IntoBytes + Debug> LineTree<D> {
             {
                 continue;
             }
-            if let Some(alloc) = &mut self.data_buffer_shard_alloc {
-                if let Some(gpu) = chunk.data.gpu.lock().take() {
-                    alloc.dealloc(gpu);
-                    chunk.data.gpu_dirty.store(true, atomic::Ordering::SeqCst);
-                }
+            if let Some(alloc) = &mut self.data_buffer_shard_alloc
+                && let Some(gpu) = chunk.data.gpu.lock().take()
+            {
+                alloc.dealloc(gpu);
+                chunk.data.gpu_dirty.store(true, atomic::Ordering::SeqCst);
             }
-            if let Some(alloc) = &mut self.timestamp_buffer_shard_alloc {
-                if let Some(gpu) = chunk.timestamps_float.gpu.lock().take() {
-                    alloc.dealloc(gpu);
-                    chunk
-                        .timestamps_float
-                        .gpu_dirty
-                        .store(true, atomic::Ordering::SeqCst);
-                }
+            if let Some(alloc) = &mut self.timestamp_buffer_shard_alloc
+                && let Some(gpu) = chunk.timestamps_float.gpu.lock().take()
+            {
+                alloc.dealloc(gpu);
+                chunk
+                    .timestamps_float
+                    .gpu_dirty
+                    .store(true, atomic::Ordering::SeqCst);
             }
         }
     }

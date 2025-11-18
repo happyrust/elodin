@@ -1,5 +1,13 @@
 [workspace]
 resolver = "2"
+# This "default-members" is tempting to set because it would make `cargo run`
+# run the `elodin` binary; however it also makes every other cargo command only
+# apply to "apps/elodin"--meaning `cargo test` would only run the apps' tests
+# and ignore the other tests unless `cargo test --workspace` was given as a
+# command. So this comment is left here as a warning to not do that. Instead
+# consider adding an alias to `.cargo/config.toml`.
+#
+# default-members = ["apps/elodin"]
 members = [
     "libs/elodin-editor",
     "libs/nox",
@@ -42,12 +50,13 @@ members = [
     "fsw/video-streamer",
     "fsw/gstreamer",
     "libs/db/eql",
-    "libs/impeller2/kdl"
+    "libs/impeller2/kdl",
+    "libs/db/examples/rust_client"
  ]
 exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve"]
 
 [workspace.package]
-version = "0.14.2"
+version = "0.15.4-alpha.0"
 edition = "2024"
 repository = "https://github.com/elodin-sys/elodin"
 
@@ -87,3 +96,7 @@ wmm.path = "libs/wmm"
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+[patch.crates-io]
+bevy_editor_cam = { git = "https://github.com/shanecelis/bevy_editor_cam.git", branch = "feat/system-set-0.6.0" }
+big_space = { git = "https://github.com/elodin-sys/big_space.git", branch = "no_prop_rot_v0.16" }

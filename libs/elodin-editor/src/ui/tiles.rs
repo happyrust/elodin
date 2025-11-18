@@ -1,3 +1,4 @@
+use bevy::log::info;
 use bevy::{
     core_pipeline::{bloom::Bloom, tonemapping::Tonemapping},
     ecs::system::{SystemParam, SystemState},
@@ -7,7 +8,9 @@ use bevy::{
 use bevy_editor_cam::prelude::{EditorCam, EnabledMotion, OrbitConstraint};
 use bevy_egui::{
     EguiContexts,
-    egui::{self, Color32, CornerRadius, Frame, RichText, Stroke, Ui, Visuals, vec2},
+    egui::{
+        self, Color32, CornerRadius, Frame, Id, RichText, Stroke, TopBottomPanel, Ui, Visuals, vec2,
+    },
 };
 use bevy_render::{
     camera::{Exposure, PhysicalCameraParameters},
@@ -15,10 +18,10 @@ use bevy_render::{
 };
 use egui::UiBuilder;
 use egui_tiles::{Container, Tile, TileId, Tiles};
-use impeller2::types::ComponentId;
 use impeller2_wkt::{Dashboard, Graph, Viewport};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap};
+use std::{fmt::Write as _, path::PathBuf};
 
 use super::{
     SelectedObject, ViewportRect,
@@ -36,13 +39,15 @@ use super::{
     query_table::{QueryTableData, QueryTablePane, QueryTableWidget},
     schematic::{graph_label, viewport_label},
     video_stream::{IsTileVisible, VideoDecoderHandle},
-    widgets::{WidgetSystem, WidgetSystemExt},
+    widgets::{RootWidgetSystem, WidgetSystem, WidgetSystemExt},
 };
+use crate::ui::compute_secondary_window_title;
 use crate::{
     EqlContext, GridHandle, MainCamera,
     object_3d::{EditableEQL, compile_eql_expr},
     plugins::{
         LogicalKeyState,
+        gizmos::GIZMO_RENDER_LAYER,
         navigation_gizmo::{RenderLayerAlloc, spawn_gizmo},
     },
     ui::dashboard::NodeUpdaterParams,
@@ -66,11 +71,148 @@ pub struct TileIcons {
     pub entity: egui::TextureId,
 }
 
-#[derive(Resource, Clone)]
+#[derive(Clone)]
 pub struct TileState {
     pub tree: egui_tiles::Tree<Pane>,
     pub tree_actions: smallvec::SmallVec<[TreeAction; 4]>,
     pub graphs: HashMap<TileId, Entity>,
+    pub container_titles: HashMap<TileId, String>,
+    tree_id: Id,
+}
+
+#[derive(Clone, Debug)]
+pub struct SecondaryWindowDescriptor {
+    pub path: PathBuf,
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SecondaryWindowId(pub u32);
+
+#[derive(Clone)]
+pub struct SecondaryWindowState {
+    pub id: SecondaryWindowId,
+    pub descriptor: SecondaryWindowDescriptor,
+    pub tile_state: TileState,
+    pub window_entity: Option<Entity>,
+    pub graph_entities: Vec<Entity>,
+}
+
+#[derive(Resource)]
+pub struct WindowManager {
+    main: TileState,
+    secondary: Vec<SecondaryWindowState>,
+    next_id: u32,
+}
+
+impl Default for WindowManager {
+    fn default() -> Self {
+        Self {
+            main: TileState::new(Id::new("main_tab_tree")),
+            secondary: Vec::new(),
+            next_id: 0,
+        }
+    }
+}
+
+impl WindowManager {
+    pub fn main(&self) -> &TileState {
+        &self.main
+    }
+
+    pub fn main_mut(&mut self) -> &mut TileState {
+        &mut self.main
+    }
+
+    pub fn take_main(&mut self) -> TileState {
+        std::mem::take(&mut self.main)
+    }
+
+    pub fn replace_main(&mut self, state: TileState) {
+        self.main = state;
+    }
+
+    pub fn secondary(&self) -> &[SecondaryWindowState] {
+        &self.secondary
+    }
+
+    pub fn secondary_mut(&mut self) -> &mut Vec<SecondaryWindowState> {
+        &mut self.secondary
+    }
+
+    pub fn take_secondary(&mut self) -> Vec<SecondaryWindowState> {
+        std::mem::take(&mut self.secondary)
+    }
+
+    pub fn replace_secondary(&mut self, states: Vec<SecondaryWindowState>) {
+        self.secondary = states;
+    }
+
+    pub fn alloc_id(&mut self) -> SecondaryWindowId {
+        let id = SecondaryWindowId(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1);
+        id
+    }
+
+    pub fn get_secondary(&self, id: SecondaryWindowId) -> Option<&SecondaryWindowState> {
+        self.secondary.iter().find(|s| s.id == id)
+    }
+
+    pub fn get_secondary_mut(
+        &mut self,
+        id: SecondaryWindowId,
+    ) -> Option<&mut SecondaryWindowState> {
+        self.secondary.iter_mut().find(|s| s.id == id)
+    }
+
+    pub fn find_secondary_by_entity(&self, entity: Entity) -> Option<SecondaryWindowId> {
+        self.secondary
+            .iter()
+            .find(|state| state.window_entity == Some(entity))
+            .map(|state| state.id)
+    }
+
+    pub fn create_secondary_window(&mut self, title: Option<String>) -> SecondaryWindowId {
+        let id = self.alloc_id();
+        let cleaned_title = title.and_then(|t| {
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        let path = cleaned_title
+            .as_deref()
+            .map(|title| {
+                let stem = super::schematic::sanitize_to_stem(title);
+                if stem.is_empty() {
+                    format!("secondary-window-{}.kdl", id.0)
+                } else {
+                    format!("{stem}.kdl")
+                }
+            })
+            .unwrap_or_else(|| format!("secondary-window-{}.kdl", id.0));
+        let descriptor = SecondaryWindowDescriptor {
+            path: PathBuf::from(path),
+            title: cleaned_title.or_else(|| Some(format!("Window {}", id.0 + 1))),
+        };
+        let tile_state = TileState::new(Id::new(("secondary_tab_tree", id.0)));
+        info!(
+            id = id.0,
+            title = descriptor.title.as_deref().unwrap_or(""),
+            path = %descriptor.path.display(),
+            "Created secondary window"
+        );
+        self.secondary.push(SecondaryWindowState {
+            id,
+            descriptor,
+            tile_state,
+            window_entity: None,
+            graph_entities: Vec::new(),
+        });
+        id
+    }
 }
 
 #[derive(Resource, Default)]
@@ -93,6 +235,19 @@ pub struct DashboardPane {
 }
 
 impl TileState {
+    pub fn has_inspector(&self) -> bool {
+        self.tree
+            .tiles
+            .iter()
+            .any(|(_, tile)| matches!(tile, Tile::Pane(Pane::Inspector)))
+    }
+
+    pub fn inspector_pending(&self) -> bool {
+        self.tree_actions
+            .iter()
+            .any(|action| matches!(action, TreeAction::AddInspector(_)))
+    }
+
     pub fn insert_tile(
         &mut self,
         tile: Tile<Pane>,
@@ -103,7 +258,7 @@ impl TileState {
             id
         } else {
             let root_id = self.tree.root().or_else(|| {
-                self.tree = egui_tiles::Tree::new_tabs("tab_tree", vec![]);
+                self.reset_tree();
                 self.tree.root()
             })?;
 
@@ -127,10 +282,8 @@ impl TileState {
 
         container.add_child(tile_id);
 
-        if active {
-            if let Container::Tabs(tabs) = container {
-                tabs.set_active(tile_id);
-            }
+        if active && let Container::Tabs(tabs) = container {
+            tabs.set_active(tile_id);
         }
 
         Some(tile_id)
@@ -138,11 +291,12 @@ impl TileState {
 
     pub fn create_graph_tile(&mut self, parent_id: Option<TileId>, graph_state: GraphBundle) {
         self.tree_actions
-            .push(TreeAction::AddGraph(parent_id, Some(graph_state)));
+            .push(TreeAction::AddGraph(parent_id, Box::new(Some(graph_state))));
     }
 
     pub fn create_graph_tile_empty(&mut self) {
-        self.tree_actions.push(TreeAction::AddGraph(None, None));
+        self.tree_actions
+            .push(TreeAction::AddGraph(None, Box::new(None)));
     }
 
     pub fn create_viewport_tile(&mut self, tile_id: Option<TileId>) {
@@ -153,9 +307,8 @@ impl TileState {
         self.tree_actions.push(TreeAction::AddViewport(None));
     }
 
-    pub fn create_monitor_tile(&mut self, component_id: ComponentId, tile_id: Option<TileId>) {
-        self.tree_actions
-            .push(TreeAction::AddMonitor(tile_id, component_id));
+    pub fn create_monitor_tile(&mut self, eql: String, tile_id: Option<TileId>) {
+        self.tree_actions.push(TreeAction::AddMonitor(tile_id, eql));
     }
 
     pub fn create_action_tile(
@@ -212,6 +365,78 @@ impl TileState {
             .push(TreeAction::AddSchematicTree(tile_id));
     }
 
+    pub fn debug_dump(&self) -> String {
+        fn visit(
+            tree: &egui_tiles::Tree<Pane>,
+            tile_id: egui_tiles::TileId,
+            depth: usize,
+            out: &mut String,
+        ) {
+            let indent = "  ".repeat(depth);
+            if let Some(tile) = tree.tiles.get(tile_id) {
+                match tile {
+                    Tile::Container(container) => {
+                        let _ = writeln!(out, "{}Container::{:?}", indent, container.kind());
+                        for child in container.children() {
+                            visit(tree, *child, depth + 1, out);
+                        }
+                    }
+                    Tile::Pane(pane) => {
+                        let (kind, label): (&str, &str) = match pane {
+                            Pane::Viewport(viewport) => ("Viewport", viewport.label.as_str()),
+                            Pane::Graph(graph) => ("Graph", graph.label.as_str()),
+                            Pane::Monitor(monitor) => ("Monitor", monitor.label.as_str()),
+                            Pane::QueryTable(_) => ("QueryTable", "QueryTable"),
+                            Pane::QueryPlot(_) => ("QueryPlot", "QueryPlot"),
+                            Pane::ActionTile(action) => ("Action", action.label.as_str()),
+                            Pane::VideoStream(video) => ("VideoStream", video.label.as_str()),
+                            Pane::Dashboard(dashboard) => ("Dashboard", dashboard.label.as_str()),
+                            Pane::Hierarchy => ("Hierarchy", "Hierarchy"),
+                            Pane::Inspector => ("Inspector", "Inspector"),
+                            Pane::SchematicTree(_) => ("SchematicTree", "SchematicTree"),
+                        };
+                        let _ = writeln!(out, "{}Pane::{} ({})", indent, kind, label);
+                    }
+                }
+            }
+        }
+
+        let mut out = String::new();
+        if let Some(root) = self.tree.root() {
+            visit(&self.tree, root, 0, &mut out);
+        } else {
+            let _ = writeln!(out, "<empty>");
+        }
+        out
+    }
+
+    pub fn collect_graph_entities(&self) -> Vec<Entity> {
+        fn visit(
+            tree: &egui_tiles::Tree<Pane>,
+            tile_id: egui_tiles::TileId,
+            out: &mut Vec<Entity>,
+        ) {
+            let Some(tile) = tree.tiles.get(tile_id) else {
+                return;
+            };
+            match tile {
+                Tile::Pane(Pane::Graph(graph)) => out.push(graph.id),
+                Tile::Pane(_) => {}
+                Tile::Container(container) => {
+                    for child in container.children() {
+                        visit(tree, *child, out);
+                    }
+                }
+            }
+        }
+
+        let mut entities = Vec::new();
+        if let Some(root) = self.tree.root() {
+            visit(&self.tree, root, &mut entities);
+        }
+        entities
+    }
+
     pub fn create_sidebars_layout(&mut self) {
         self.tree_actions.push(TreeAction::AddSidebars);
     }
@@ -256,17 +481,45 @@ impl TileState {
                 }
                 _ => {}
             }
-
-            // if selected_object.is_tile_selected(*tile_id) {
-            //     *selected_object = SelectedObject::None;
-            // }
         }
 
-        if let Some(root_id) = self.tree.root() {
-            if let Some(Tile::Container(root)) = self.tree.tiles.get_mut(root_id) {
-                root.retain(|_| false);
-            };
+        if let Some(root_id) = self.tree.root()
+            && let Some(Tile::Container(root)) = self.tree.tiles.get_mut(root_id)
+        {
+            root.retain(|_| false);
         };
+        self.graphs.clear();
+        self.container_titles.clear();
+        self.tree_actions.clear();
+        self.reset_tree();
+    }
+
+    pub fn get_container_title(&self, id: TileId) -> Option<&str> {
+        self.container_titles.get(&id).map(|s| s.as_str())
+    }
+
+    pub fn set_container_title(&mut self, id: TileId, title: impl Into<String>) {
+        let title = title.into();
+        self.container_titles.insert(id, title);
+    }
+
+    pub fn clear_container_title(&mut self, id: TileId) {
+        self.container_titles.remove(&id);
+    }
+
+    pub fn container_title_or_default(
+        &self,
+        tiles: &egui_tiles::Tiles<Pane>,
+        id: TileId,
+    ) -> String {
+        if let Some(t) = self.get_container_title(id) {
+            return t.to_owned();
+        }
+        if let Some(egui_tiles::Tile::Container(c)) = tiles.get(id) {
+            format!("{:?}", c.kind())
+        } else {
+            "Container".to_owned()
+        }
     }
 }
 
@@ -330,7 +583,6 @@ impl Pane {
     fn ui(
         &mut self,
         ui: &mut Ui,
-        //state: &mut TileLayout<'_, '_>,
         icons: &TileIcons,
         world: &mut World,
         tree_actions: &mut SmallVec<[TreeAction; 4]>,
@@ -450,7 +702,7 @@ impl ViewportPane {
         viewport: &Viewport,
         label: String,
     ) -> Self {
-        let mut main_camera_layers = RenderLayers::default();
+        let mut main_camera_layers = RenderLayers::default().with(GIZMO_RENDER_LAYER);
         let mut grid_layers = RenderLayers::none();
         if let Some(grid_layer) = render_layer_alloc.alloc() {
             main_camera_layers = main_camera_layers.with(grid_layer);
@@ -487,6 +739,7 @@ impl ViewportPane {
                 Transform::from_translation(Vec3::new(5.0, 5.0, 10.0))
                     .looking_at(Vec3::ZERO, Vec3::Y),
                 impeller2_wkt::WorldPos::default(),
+                Name::new("viewport"),
             ))
             .id();
         let pos = viewport
@@ -516,7 +769,7 @@ impl ViewportPane {
             Transform::default(),
             Camera3d::default(),
             Camera {
-                hdr: false,
+                hdr: viewport.hdr,
                 clear_color: ClearColorConfig::Default,
                 order: 1,
                 ..Default::default()
@@ -530,7 +783,6 @@ impl ViewportPane {
                 aperture_f_stops: 2.8,
                 shutter_speed_s: 1.0 / 200.0,
                 sensitivity_iso: 400.0,
-                // full frame sensor height
                 sensor_height: 24.0 / 1000.0,
             }),
             main_camera_layers,
@@ -547,6 +799,7 @@ impl ViewportPane {
             GridHandle { grid: grid_id },
             crate::ui::inspector::viewport::Viewport::new(parent, pos, look_at),
             ChildOf(parent),
+            Name::new("viewport camera3d"),
         ));
 
         camera.insert(Bloom { ..default() });
@@ -588,13 +841,25 @@ impl GraphPane {
     }
 }
 
-impl Default for TileState {
-    fn default() -> Self {
+impl TileState {
+    pub fn new(tree_id: Id) -> Self {
         Self {
-            tree: egui_tiles::Tree::new_tabs("tab_tree", vec![]),
+            tree: egui_tiles::Tree::new_tabs(tree_id, vec![]),
             tree_actions: SmallVec::new(),
             graphs: HashMap::new(),
+            container_titles: HashMap::new(),
+            tree_id,
         }
+    }
+
+    fn reset_tree(&mut self) {
+        self.tree = egui_tiles::Tree::new_tabs(self.tree_id, vec![]);
+    }
+}
+
+impl Default for TileState {
+    fn default() -> Self {
+        Self::new(Id::new("main_tab_tree"))
     }
 }
 
@@ -602,13 +867,16 @@ struct TreeBehavior<'w> {
     icons: TileIcons,
     tree_actions: SmallVec<[TreeAction; 4]>,
     world: &'w mut World,
+    container_titles: HashMap<TileId, String>,
+    read_only: bool,
+    target_window: Option<SecondaryWindowId>,
 }
 
 #[derive(Clone)]
 pub enum TreeAction {
     AddViewport(Option<TileId>),
-    AddGraph(Option<TileId>, Option<GraphBundle>),
-    AddMonitor(Option<TileId>, ComponentId),
+    AddGraph(Option<TileId>, Box<Option<GraphBundle>>),
+    AddMonitor(Option<TileId>, String),
     AddQueryTable(Option<TileId>),
     AddQueryPlot(Option<TileId>),
     AddActionTile(Option<TileId>, String, String),
@@ -620,6 +888,7 @@ pub enum TreeAction {
     AddSidebars,
     DeleteTab(TileId),
     SelectTile(TileId),
+    RenameContainer(TileId, String),
 }
 
 enum TabState {
@@ -660,10 +929,40 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
         } else {
             TabState::Inactive
         };
-        let text = self.tab_title_for_tile(tiles, tile_id);
+
+        let is_container = matches!(tiles.get(tile_id), Some(egui_tiles::Tile::Container(_)));
+        let persist_id = id.with(("rename_title", tile_id));
+        let edit_flag_id = id.with(("rename_editing", tile_id));
+        let edit_buf_id = id.with(("rename_buffer", tile_id));
+        let mut is_editing = ui
+            .ctx()
+            .data(|d| d.get_temp::<bool>(edit_flag_id))
+            .unwrap_or(false);
+
+        let title_str: String = if is_container {
+            if let Some(custom) = ui.ctx().data(|d| d.get_temp::<String>(persist_id)) {
+                custom
+            } else if let Some(t) = self.container_titles.get(&tile_id) {
+                t.clone()
+            } else {
+                match tiles.get(tile_id) {
+                    Some(egui_tiles::Tile::Container(c)) => format!("{:?}", c.kind()),
+                    _ => "Container".to_owned(),
+                }
+            }
+        } else {
+            self.tab_title_for_tile(tiles, tile_id).text().to_string()
+        };
+
         let mut font_id = egui::TextStyle::Button.resolve(ui.style());
         font_id.size = 11.0;
-        let galley = text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, font_id);
+        let mut galley = egui::WidgetText::from(title_str.clone()).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            font_id.clone(),
+        );
+
         let x_margin = self.tab_title_spacing(ui.visuals());
         let (_, rect) = ui.allocate_space(vec2(
             galley.size().x + x_margin * 4.0,
@@ -673,6 +972,13 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
             .shrink2(vec2(x_margin * 4.0, 0.0))
             .translate(vec2(-3.0 * x_margin, 0.0));
         let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+
+        if !self.read_only && is_container && state.active && response.clicked() && !is_editing {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(edit_buf_id, title_str.clone()));
+            ui.ctx().data_mut(|d| d.insert_temp(edit_flag_id, true));
+            is_editing = true;
+        }
 
         if ui.is_rect_visible(rect) && !state.is_being_dragged {
             let scheme = get_scheme();
@@ -687,13 +993,80 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
             };
 
             ui.painter().rect_filled(rect, 0.0, bg_color);
-            ui.painter().galley(
-                egui::Align2::LEFT_CENTER
-                    .align_size_within_rect(galley.size(), text_rect)
-                    .min,
-                galley,
-                text_color,
-            );
+
+            if !self.read_only && is_container && is_editing {
+                let label_rect =
+                    egui::Align2::LEFT_CENTER.align_size_within_rect(galley.size(), text_rect);
+                let edit_rect = label_rect.expand(1.0);
+
+                let mut buf = ui.ctx().data_mut(|d| {
+                    d.get_temp_mut_or::<String>(edit_buf_id, String::new())
+                        .clone()
+                });
+
+                let resp = ui
+                    .scope(|ui| {
+                        ui.visuals_mut().override_text_color = Some(Color32::BLACK);
+                        ui.put(
+                            edit_rect,
+                            egui::TextEdit::singleline(&mut buf)
+                                .font(egui::TextStyle::Button)
+                                .clip_text(true)
+                                .desired_width(edit_rect.width())
+                                .frame(false),
+                        )
+                    })
+                    .inner;
+
+                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let lost_focus = resp.lost_focus();
+
+                if enter_pressed || lost_focus {
+                    let new_title = buf.trim().to_owned();
+
+                    ui.ctx().data_mut(|d| d.insert_temp(edit_flag_id, false));
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(edit_buf_id, new_title.clone()));
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(persist_id, new_title.clone()));
+                    ui.memory_mut(|m| m.surrender_focus(resp.id));
+
+                    // Au lieu de toucher ui_state ici, on envoie une action qui sera traitée après.
+                    if !self.read_only {
+                        self.tree_actions
+                            .push(TreeAction::RenameContainer(tile_id, new_title.clone()));
+                    }
+
+                    galley = egui::WidgetText::from(new_title).into_galley(
+                        ui,
+                        Some(egui::TextWrapMode::Extend),
+                        f32::INFINITY,
+                        font_id.clone(),
+                    );
+
+                    ui.painter().galley(
+                        egui::Align2::LEFT_CENTER
+                            .align_size_within_rect(galley.size(), text_rect)
+                            .min,
+                        galley.clone(),
+                        text_color,
+                    );
+                } else {
+                    ui.ctx().data_mut(|d| d.insert_temp(edit_buf_id, buf));
+                    if !resp.has_focus() {
+                        resp.request_focus();
+                    }
+                }
+            } else {
+                ui.painter().galley(
+                    egui::Align2::LEFT_CENTER
+                        .align_size_within_rect(galley.size(), text_rect)
+                        .min,
+                    galley.clone(),
+                    text_color,
+                );
+            }
+
             ui.add_space(-3.0 * x_margin);
             let close_response = ui.add(
                 EImageButton::new(self.icons.close)
@@ -731,7 +1104,7 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
         tile_id: TileId,
         button_response: egui::Response,
     ) -> egui::Response {
-        if button_response.middle_clicked() {
+        if button_response.middle_clicked() && !self.read_only {
             self.tree_actions.push(TreeAction::DeleteTab(tile_id));
         } else if button_response.clicked() {
             self.tree_actions.push(TreeAction::SelectTile(tile_id));
@@ -770,7 +1143,16 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
         frame.stroke = Stroke::NONE;
         frame.shadow = egui::epaint::Shadow::NONE;
         frame.show(ui, |ui| {
-            let text = self.tab_title_for_tile(tiles, tile_id);
+            let text = match tiles.get(tile_id) {
+                Some(Tile::Container(_)) => {
+                    if let Some(t) = self.container_titles.get(&tile_id) {
+                        egui::WidgetText::from(t.clone())
+                    } else {
+                        self.tab_title_for_tile(tiles, tile_id)
+                    }
+                }
+                _ => self.tab_title_for_tile(tiles, tile_id),
+            };
             let text = text.text();
             ui.label(
                 RichText::new(text)
@@ -788,6 +1170,9 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
         _tabs: &egui_tiles::Tabs,
         _scroll_offset: &mut f32,
     ) {
+        if self.read_only {
+            return;
+        }
         let mut layout = SystemState::<TileLayout>::new(self.world);
         let mut layout = layout.get_mut(self.world);
 
@@ -806,6 +1191,7 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
             layout
                 .cmd_palette_state
                 .open_page(move || palette_items::create_tiles(tile_id));
+            layout.cmd_palette_state.target_window = self.target_window;
         }
     }
 }
@@ -814,24 +1200,30 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
 pub struct TileSystem<'w, 's> {
     contexts: EguiContexts<'w, 's>,
     images: Local<'s, images::Images>,
-    ui_state: Res<'w, TileState>,
+    windows: Res<'w, WindowManager>,
 }
 
-impl WidgetSystem for TileSystem<'_, '_> {
-    type Args = ();
-    type Output = ();
-
-    fn ui_system(
+impl<'w, 's> TileSystem<'w, 's> {
+    fn prepare_panel_data(
         world: &mut World,
         state: &mut SystemState<Self>,
-        ui: &mut egui::Ui,
-        _args: Self::Args,
-    ) {
-        let state_mut = state.get_mut(world);
+        target: Option<SecondaryWindowId>,
+    ) -> Option<(TileIcons, bool, bool)> {
+        let read_only = false;
+        let params = state.get_mut(world);
+        let mut contexts = params.contexts;
+        let images = params.images;
+        let is_empty = match target {
+            Some(id) => params
+                .windows
+                .get_secondary(id)
+                .map(|s| s.tile_state.is_empty() && s.tile_state.tree_actions.is_empty()),
+            None => Some(
+                params.windows.main().is_empty() && params.windows.main().tree_actions.is_empty(),
+            ),
+        };
 
-        let mut contexts = state_mut.contexts;
-        let images = state_mut.images;
-        let ui_state = state_mut.ui_state;
+        let is_empty_tile_tree = is_empty?;
 
         let icons = TileIcons {
             add: contexts.add_image(images.icon_add.clone_weak()),
@@ -839,7 +1231,6 @@ impl WidgetSystem for TileSystem<'_, '_> {
             scrub: contexts.add_image(images.icon_scrub.clone_weak()),
             tile_3d_viewer: contexts.add_image(images.icon_tile_3d_viewer.clone_weak()),
             tile_graph: contexts.add_image(images.icon_tile_graph.clone_weak()),
-
             subtract: contexts.add_image(images.icon_subtract.clone_weak()),
             chart: contexts.add_image(images.icon_chart.clone_weak()),
             setting: contexts.add_image(images.icon_setting.clone_weak()),
@@ -851,28 +1242,140 @@ impl WidgetSystem for TileSystem<'_, '_> {
             entity: contexts.add_image(images.icon_entity.clone_weak()),
         };
 
-        let is_empty_tile_tree = ui_state.is_empty() && ui_state.tree_actions.is_empty();
+        Some((icons, is_empty_tile_tree, read_only))
+    }
+
+    fn render_panel_contents(
+        world: &mut World,
+        ui: &mut egui::Ui,
+        target: Option<SecondaryWindowId>,
+        icons: TileIcons,
+        is_empty_tile_tree: bool,
+        read_only: bool,
+    ) {
+        if is_empty_tile_tree && !read_only {
+            ui.add_widget_with::<TileLayoutEmpty>(
+                world,
+                "tile_layout_empty",
+                TileLayoutEmptyArgs {
+                    icons: icons.clone(),
+                    window: target,
+                },
+            );
+            return;
+        }
+
+        ui.add_widget_with::<TileLayout>(
+            world,
+            "tile_layout",
+            TileLayoutArgs {
+                icons,
+                window: target,
+                read_only,
+            },
+        );
+    }
+}
+
+impl WidgetSystem for TileSystem<'_, '_> {
+    type Args = Option<SecondaryWindowId>;
+    type Output = ();
+
+    fn ui_system(
+        world: &mut World,
+        state: &mut SystemState<Self>,
+        ui: &mut egui::Ui,
+        target: Self::Args,
+    ) {
+        let Some((icons, is_empty_tile_tree, read_only)) =
+            Self::prepare_panel_data(world, state, target)
+        else {
+            return;
+        };
+
+        let fill_color = if is_empty_tile_tree {
+            get_scheme().bg_secondary
+        } else {
+            colors::TRANSPARENT
+        };
 
         egui::CentralPanel::default()
             .frame(Frame {
-                fill: if is_empty_tile_tree {
-                    get_scheme().bg_secondary
-                } else {
-                    colors::TRANSPARENT
-                },
+                fill: fill_color,
                 ..Default::default()
             })
             .show_inside(ui, |ui| {
-                if is_empty_tile_tree {
-                    ui.add_widget_with::<TileLayoutEmpty>(
-                        world,
-                        "tile_layout_empty",
-                        icons.clone(),
-                    );
-                } else {
-                    ui.add_widget_with::<TileLayout>(world, "tile_layout", icons.clone());
-                }
+                Self::render_panel_contents(
+                    world,
+                    ui,
+                    target,
+                    icons.clone(),
+                    is_empty_tile_tree,
+                    read_only,
+                );
             });
+    }
+}
+
+impl RootWidgetSystem for TileSystem<'_, '_> {
+    type Args = Option<SecondaryWindowId>;
+    type Output = ();
+
+    fn ctx_system(
+        world: &mut World,
+        state: &mut SystemState<Self>,
+        ctx: &mut egui::Context,
+        target: Self::Args,
+    ) {
+        let Some((icons, is_empty_tile_tree, read_only)) =
+            Self::prepare_panel_data(world, state, target)
+        else {
+            return;
+        };
+
+        let fill_color = if is_empty_tile_tree {
+            get_scheme().bg_secondary
+        } else {
+            colors::TRANSPARENT
+        };
+
+        let header = target.and_then(|id| {
+            world
+                .get_resource::<WindowManager>()
+                .and_then(|windows| windows.get_secondary(id))
+                .map(|state| (id, compute_secondary_window_title(state)))
+        });
+
+        if let Some((id, title)) = header.as_ref() {
+            TopBottomPanel::top(format!("secondary_header_{:?}", id))
+                .exact_height(32.0)
+                .show(ctx, |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        // leave room for native window buttons on macOS
+                        ui.add_space(60.0);
+                        ui.label(RichText::new(title).color(Color32::WHITE).strong());
+                    });
+                });
+        }
+
+        let central = egui::CentralPanel::default().frame(Frame {
+            fill: fill_color,
+            ..Default::default()
+        });
+
+        central.show(ctx, |ui| {
+            if header.is_some() {
+                ui.add_space(6.0);
+            }
+            Self::render_panel_contents(
+                world,
+                ui,
+                target,
+                icons.clone(),
+                is_empty_tile_tree,
+                read_only,
+            );
+        });
     }
 }
 
@@ -881,8 +1384,14 @@ pub struct TileLayoutEmpty<'w> {
     cmd_palette_state: ResMut<'w, CommandPaletteState>,
 }
 
+#[derive(Clone)]
+pub struct TileLayoutEmptyArgs {
+    pub icons: TileIcons,
+    pub window: Option<SecondaryWindowId>,
+}
+
 impl WidgetSystem for TileLayoutEmpty<'_> {
-    type Args = TileIcons;
+    type Args = TileLayoutEmptyArgs;
     type Output = ();
 
     fn ui_system(
@@ -893,7 +1402,7 @@ impl WidgetSystem for TileLayoutEmpty<'_> {
     ) {
         let mut state_mut = state.get_mut(world);
 
-        let icons = args;
+        let TileLayoutEmptyArgs { icons, window } = args;
 
         let button_height = 160.0;
         let button_width = 240.0;
@@ -921,6 +1430,7 @@ impl WidgetSystem for TileLayoutEmpty<'_> {
                         state_mut
                             .cmd_palette_state
                             .open_item(palette_items::create_viewport(None));
+                        state_mut.cmd_palette_state.target_window = window;
                     }
 
                     let create_graph_btn = ui.add(
@@ -934,6 +1444,7 @@ impl WidgetSystem for TileLayoutEmpty<'_> {
                         state_mut
                             .cmd_palette_state
                             .open_item(palette_items::create_graph(None));
+                        state_mut.cmd_palette_state.target_window = window;
                     }
 
                     let create_monitor_btn = ui.add(
@@ -947,6 +1458,7 @@ impl WidgetSystem for TileLayoutEmpty<'_> {
                         state_mut
                             .cmd_palette_state
                             .open_item(palette_items::create_monitor(None));
+                        state_mut.cmd_palette_state.target_window = window;
                     }
                 });
             },
@@ -969,8 +1481,15 @@ pub struct TileLayout<'w, 's> {
     node_updater_params: NodeUpdaterParams<'w, 's>,
 }
 
+#[derive(Clone)]
+pub struct TileLayoutArgs {
+    pub icons: TileIcons,
+    pub window: Option<SecondaryWindowId>,
+    pub read_only: bool,
+}
+
 impl WidgetSystem for TileLayout<'_, '_> {
-    type Args = TileIcons;
+    type Args = TileLayoutArgs;
     type Output = ();
 
     fn ui_system(
@@ -979,8 +1498,20 @@ impl WidgetSystem for TileLayout<'_, '_> {
         ui: &mut egui::Ui,
         args: Self::Args,
     ) {
-        world.resource_scope::<TileState, _>(|world, mut ui_state| {
-            let icons = args;
+        let TileLayoutArgs {
+            icons,
+            window,
+            read_only,
+        } = args;
+
+        world.resource_scope::<WindowManager, _>(|world, mut windows| {
+            let Some(ui_state) = (match window {
+                Some(id) => windows.get_secondary_mut(id).map(|s| &mut s.tile_state),
+                None => Some(windows.main_mut()),
+            }) else {
+                return;
+            };
+            let icons = icons;
 
             let mut tree_actions = {
                 let tab_diffs = std::mem::take(&mut ui_state.tree_actions);
@@ -988,6 +1519,9 @@ impl WidgetSystem for TileLayout<'_, '_> {
                     icons,
                     world,
                     tree_actions: tab_diffs,
+                    container_titles: ui_state.container_titles.clone(),
+                    read_only,
+                    target_window: window,
                 };
                 ui_state.tree.ui(&mut behavior, ui);
 
@@ -1006,8 +1540,14 @@ impl WidgetSystem for TileLayout<'_, '_> {
             }
 
             for diff in tree_actions.drain(..) {
+                if read_only && !matches!(diff, TreeAction::SelectTile(_)) {
+                    continue;
+                }
                 match diff {
                     TreeAction::DeleteTab(tile_id) => {
+                        if read_only {
+                            continue;
+                        }
                         let Some(tile) = ui_state.tree.tiles.get(tile_id) else {
                             continue;
                         };
@@ -1056,6 +1596,9 @@ impl WidgetSystem for TileLayout<'_, '_> {
                         }
                     }
                     TreeAction::AddViewport(parent_tile_id) => {
+                        if read_only {
+                            continue;
+                        }
                         let viewport = Viewport::default();
                         let label = viewport_label(&viewport);
                         let viewport_pane = ViewportPane::spawn(
@@ -1078,9 +1621,12 @@ impl WidgetSystem for TileLayout<'_, '_> {
                         }
                     }
                     TreeAction::AddGraph(parent_tile_id, graph_bundle) => {
+                        if read_only {
+                            continue;
+                        }
                         let graph_label = graph_label(&Graph::default());
 
-                        let graph_bundle = if let Some(graph_bundle) = graph_bundle {
+                        let graph_bundle = if let Some(graph_bundle) = *graph_bundle {
                             graph_bundle
                         } else {
                             GraphBundle::new(
@@ -1102,8 +1648,11 @@ impl WidgetSystem for TileLayout<'_, '_> {
                             ui_state.graphs.insert(tile_id, graph_id);
                         }
                     }
-                    TreeAction::AddMonitor(parent_tile_id, component_id) => {
-                        let monitor = MonitorPane::new("Monitor".to_string(), component_id);
+                    TreeAction::AddMonitor(parent_tile_id, eql) => {
+                        if read_only {
+                            continue;
+                        }
+                        let monitor = MonitorPane::new("Monitor".to_string(), eql);
 
                         let pane = Pane::Monitor(monitor);
                         if let Some(tile_id) =
@@ -1113,6 +1662,9 @@ impl WidgetSystem for TileLayout<'_, '_> {
                         }
                     }
                     TreeAction::AddVideoStream(parent_tile_id, msg_id, label) => {
+                        if read_only {
+                            continue;
+                        }
                         let entity = state_mut
                             .commands
                             .spawn((
@@ -1142,6 +1694,9 @@ impl WidgetSystem for TileLayout<'_, '_> {
                         }
                     }
                     TreeAction::AddDashboard(parent_tile_id, dashboard, label) => {
+                        if read_only {
+                            continue;
+                        }
                         let entity = match spawn_dashboard(
                             &dashboard,
                             &state_mut.eql_ctx.0,
@@ -1149,10 +1704,7 @@ impl WidgetSystem for TileLayout<'_, '_> {
                             &state_mut.node_updater_params,
                         ) {
                             Ok(entity) => entity,
-                            Err(_) => {
-                                // Handle error - create a default entity or show error message
-                                state_mut.commands.spawn(bevy::ui::Node::default()).id()
-                            }
+                            Err(_) => state_mut.commands.spawn(bevy::ui::Node::default()).id(),
                         };
                         let pane = Pane::Dashboard(DashboardPane { entity, label });
                         if let Some(tile_id) =
@@ -1164,6 +1716,34 @@ impl WidgetSystem for TileLayout<'_, '_> {
 
                     TreeAction::SelectTile(tile_id) => {
                         ui_state.tree.make_active(|id, _| id == tile_id);
+
+                        if let Some(egui_tiles::Tile::Pane(pane)) = ui_state.tree.tiles.get(tile_id)
+                        {
+                            match pane {
+                                Pane::Graph(graph) => {
+                                    *state_mut.selected_object =
+                                        SelectedObject::Graph { graph_id: graph.id };
+                                    if !ui_state.has_inspector() && !ui_state.inspector_pending() {
+                                        ui_state.tree_actions.push(TreeAction::AddInspector(None));
+                                    }
+                                }
+                                Pane::QueryPlot(plot) => {
+                                    *state_mut.selected_object = SelectedObject::Graph {
+                                        graph_id: plot.entity,
+                                    };
+                                    if !ui_state.has_inspector() && !ui_state.inspector_pending() {
+                                        ui_state.tree_actions.push(TreeAction::AddInspector(None));
+                                    }
+                                }
+                                Pane::Viewport(viewport) => {
+                                    if let Some(camera) = viewport.camera {
+                                        *state_mut.selected_object =
+                                            SelectedObject::Viewport { camera };
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     TreeAction::AddActionTile(parent_tile_id, button_name, lua_code) => {
                         let entity = state_mut
@@ -1216,6 +1796,9 @@ impl WidgetSystem for TileLayout<'_, '_> {
                         }
                     }
                     TreeAction::AddHierarchy(parent_tile_id) => {
+                        if read_only {
+                            continue;
+                        }
                         if let Some(tile_id) =
                             ui_state.insert_tile(Tile::Pane(Pane::Hierarchy), parent_tile_id, true)
                         {
@@ -1223,6 +1806,9 @@ impl WidgetSystem for TileLayout<'_, '_> {
                         }
                     }
                     TreeAction::AddInspector(parent_tile_id) => {
+                        if read_only {
+                            continue;
+                        }
                         if let Some(tile_id) =
                             ui_state.insert_tile(Tile::Pane(Pane::Inspector), parent_tile_id, true)
                         {
@@ -1230,6 +1816,9 @@ impl WidgetSystem for TileLayout<'_, '_> {
                         }
                     }
                     TreeAction::AddSchematicTree(parent_tile_id) => {
+                        if read_only {
+                            continue;
+                        }
                         let entity = state_mut
                             .commands
                             .spawn(super::schematic::tree::TreeWidgetState::default())
@@ -1242,6 +1831,9 @@ impl WidgetSystem for TileLayout<'_, '_> {
                         }
                     }
                     TreeAction::AddSidebars => {
+                        if read_only {
+                            continue;
+                        }
                         let hierarchy = ui_state.tree.tiles.insert_new(Tile::Pane(Pane::Hierarchy));
                         let inspector = ui_state.tree.tiles.insert_new(Tile::Pane(Pane::Inspector));
 
@@ -1261,6 +1853,12 @@ impl WidgetSystem for TileLayout<'_, '_> {
                             .insert_new(Tile::Container(Container::Linear(linear)));
                         ui_state.tree.root = Some(root);
                     }
+                    TreeAction::RenameContainer(tile_id, title) => {
+                        if read_only {
+                            continue;
+                        }
+                        ui_state.set_container_title(tile_id, title);
+                    }
                 }
             }
             let tiles = ui_state.tree.tiles.iter();
@@ -1269,10 +1867,11 @@ impl WidgetSystem for TileLayout<'_, '_> {
                 let egui_tiles::Tile::Pane(pane) = tile else {
                     continue;
                 };
+                let visible = read_only || active_tiles.contains(tile_id);
                 match pane {
                     Pane::Viewport(viewport) => {
                         let Some(cam) = viewport.camera else { continue };
-                        if active_tiles.contains(tile_id) {
+                        if visible {
                             if let Ok(mut cam) = state_mut.commands.get_entity(cam) {
                                 cam.try_insert(ViewportRect(viewport.rect));
                             }
@@ -1284,7 +1883,7 @@ impl WidgetSystem for TileLayout<'_, '_> {
                     Pane::Inspector => {}
                     Pane::SchematicTree(_) => {}
                     Pane::Graph(graph) => {
-                        if active_tiles.contains(tile_id) {
+                        if visible {
                             if let Ok(mut cam) = state_mut.commands.get_entity(graph.id) {
                                 cam.try_insert(ViewportRect(graph.rect));
                             }
@@ -1295,7 +1894,7 @@ impl WidgetSystem for TileLayout<'_, '_> {
                     Pane::Monitor(_) => {}
                     Pane::QueryTable(_) => {}
                     Pane::QueryPlot(query_plot) => {
-                        if active_tiles.contains(tile_id) {
+                        if visible {
                             if let Ok(mut cam) = state_mut.commands.get_entity(query_plot.entity) {
                                 cam.try_insert(ViewportRect(query_plot.rect));
                             }
@@ -1307,13 +1906,13 @@ impl WidgetSystem for TileLayout<'_, '_> {
                     Pane::ActionTile(_) => {}
                     Pane::VideoStream(stream) => {
                         if let Ok(mut stream) = state_mut.commands.get_entity(stream.entity) {
-                            stream.try_insert(IsTileVisible(active_tiles.contains(tile_id)));
+                            stream.try_insert(IsTileVisible(visible));
                         }
                     }
 
                     Pane::Dashboard(dash) => {
                         if let Ok(mut stream) = state_mut.commands.get_entity(dash.entity) {
-                            stream.try_insert(IsTileVisible(active_tiles.contains(tile_id)));
+                            stream.try_insert(IsTileVisible(visible));
                         }
                     }
                 }
@@ -1322,10 +1921,9 @@ impl WidgetSystem for TileLayout<'_, '_> {
     }
 }
 
-pub fn shortcuts(key_state: Res<LogicalKeyState>, mut ui_state: ResMut<TileState>) {
-    // tab switching
+pub fn shortcuts(key_state: Res<LogicalKeyState>, mut windows: ResMut<WindowManager>) {
+    let ui_state = windows.main_mut();
     if key_state.pressed(&Key::Control) && key_state.just_pressed(&Key::Tab) {
-        // TODO(sphw): we should have a more intelligent focus system
         let Some(tile_id) = ui_state.tree.root() else {
             return;
         };

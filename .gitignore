@@ -8,6 +8,10 @@ result-bin
 .venv
 .vscode
 node_modules
+profile_output
+
+# ai
+ai-context
 
 # kubernetes
 kubernetes/deploy

@@ -1,4 +1,3 @@
-use assets::open_assets;
 use datafusion::common::HashSet;
 use futures_lite::StreamExt;
 use impeller2::registry::VTableRegistry;
@@ -26,11 +25,13 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     ffi::OsStr,
+    fs::{self, File},
+    io::{self},
     net::{SocketAddr, ToSocketAddrs},
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc, Condvar, Mutex as StdMutex, RwLock,
         atomic::{self, AtomicBool, AtomicI64, AtomicU64},
     },
     time::{Duration, Instant},
@@ -53,21 +54,192 @@ pub use error::Error;
 
 pub mod append_log;
 mod arrow;
-mod assets;
 pub mod axum;
 mod error;
 mod msg_log;
 pub(crate) mod time_series;
 mod vtable_stream;
 
+pub struct SnapshotBarrier {
+    state: StdMutex<SnapshotState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct SnapshotState {
+    active_writers: usize,
+    snapshot_active: bool,
+}
+
+pub struct SnapshotWriterGuard<'a> {
+    barrier: &'a SnapshotBarrier,
+    released: bool,
+}
+
+pub struct SnapshotGuard<'a> {
+    barrier: &'a SnapshotBarrier,
+    released: bool,
+}
+
+impl SnapshotBarrier {
+    pub fn new() -> Self {
+        Self {
+            state: StdMutex::new(SnapshotState::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub fn enter_writer(&self) -> SnapshotWriterGuard<'_> {
+        let mut state = self.state.lock().expect("snapshot barrier mutex poisoned");
+        while state.snapshot_active {
+            state = self.cv.wait(state).unwrap();
+        }
+        state.active_writers += 1;
+        SnapshotWriterGuard {
+            barrier: self,
+            released: false,
+        }
+    }
+
+    pub fn begin_snapshot(&self) -> SnapshotGuard<'_> {
+        let mut state = self.state.lock().unwrap();
+        while state.snapshot_active {
+            state = self.cv.wait(state).unwrap();
+        }
+        state.snapshot_active = true;
+        while state.active_writers > 0 {
+            state = self.cv.wait(state).unwrap();
+        }
+        SnapshotGuard {
+            barrier: self,
+            released: false,
+        }
+    }
+
+    fn release_writer(&self) {
+        let mut state = self.state.lock().unwrap();
+        debug_assert!(state.active_writers > 0);
+        if state.active_writers == 0 {
+            return;
+        }
+        state.active_writers -= 1;
+        let should_notify = state.active_writers == 0;
+        drop(state);
+        if should_notify {
+            self.cv.notify_all();
+        }
+    }
+
+    fn finish_snapshot(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.snapshot_active = false;
+        drop(state);
+        self.cv.notify_all();
+    }
+}
+
+impl Default for SnapshotBarrier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> SnapshotWriterGuard<'a> {
+    pub fn release(mut self) {
+        if self.released {
+            return;
+        }
+        self.barrier.release_writer();
+        self.released = true;
+    }
+}
+
+impl<'a> Drop for SnapshotWriterGuard<'a> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.barrier.release_writer();
+            self.released = true;
+        }
+    }
+}
+
+impl<'a> SnapshotGuard<'a> {
+    pub fn release(mut self) {
+        if self.released {
+            return;
+        }
+        self.barrier.finish_snapshot();
+        self.released = true;
+    }
+}
+
+impl<'a> Drop for SnapshotGuard<'a> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.barrier.finish_snapshot();
+            self.released = true;
+        }
+    }
+}
+
+fn sync_dir(path: &Path) -> io::Result<()> {
+    #[cfg(target_family = "unix")]
+    {
+        let dir = File::open(path)?;
+        dir.sync_all()
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn copy_file_native(src: &Path, dst: &Path) -> Result<(), Error> {
+    let metadata = fs::metadata(src)?;
+    reflink_copy::reflink_or_copy(src, dst)?;
+    fs::set_permissions(dst, metadata.permissions())?;
+    let file = File::open(dst)?;
+    file.sync_all()?;
+    if let Some(parent) = dst.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn copy_dir_native(src: &Path, dst: &Path) -> Result<(), Error> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_native(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            copy_file_native(&src_path, &dst_path)?;
+        } else {
+            // skip non-regular entries
+            warn!(
+                "Skipping irregular file for db copy {:?}",
+                src_path.display()
+            );
+        }
+    }
+    let metadata = fs::metadata(src)?;
+    fs::set_permissions(dst, metadata.permissions())?;
+    let _ = sync_dir(dst);
+    Ok(())
+}
+
 pub struct DB {
     pub vtable_gen: AtomicCell<u64>,
     state: RwLock<State>,
+    snapshot_barrier: SnapshotBarrier,
     pub recording_cell: PlayingCell,
 
     // metadata
     pub path: PathBuf,
-    pub time_step: AtomicU64,
     pub default_stream_time_step: AtomicU64,
     pub last_updated: AtomicCell<Timestamp>,
     pub earliest_timestamp: Timestamp,
@@ -77,7 +249,6 @@ pub struct DB {
 pub struct State {
     components: HashMap<ComponentId, Component>,
     component_metadata: HashMap<ComponentId, ComponentMetadata>,
-    assets: HashMap<AssetId, memmap2::Mmap>,
 
     msg_logs: HashMap<PacketId, MsgLog>,
 
@@ -85,6 +256,8 @@ pub struct State {
     streams: HashMap<StreamId, Arc<FixedRateStreamState>>,
 
     udp_vtable_streams: HashSet<(SocketAddr, [u8; 2])>,
+
+    pub db_config: DbConfig,
 }
 
 impl DB {
@@ -95,18 +268,21 @@ impl DB {
     pub fn with_time_step(path: PathBuf, time_step: Duration) -> Result<Self, Error> {
         info!(?path, "created db");
 
+        std::fs::create_dir_all(&path)?;
         let default_stream_time_step = AtomicU64::new(time_step.as_nanos() as u64);
-        let time_step = AtomicU64::new(time_step.as_nanos() as u64);
         let state = State {
-            assets: open_assets(&path)?,
+            db_config: DbConfig {
+                default_stream_time_step: time_step,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let db = DB {
             state: RwLock::new(state),
+            snapshot_barrier: SnapshotBarrier::new(),
             recording_cell: PlayingCell::new(true),
             path,
             vtable_gen: AtomicCell::new(0),
-            time_step,
             default_stream_time_step,
             last_updated: AtomicCell::new(Timestamp(i64::MIN)),
             earliest_timestamp: Timestamp::now(),
@@ -125,19 +301,96 @@ impl DB {
         f(&mut state)
     }
 
-    fn db_settings(&self) -> DbSettings {
-        DbSettings {
-            recording: self.recording_cell.is_playing(),
-            time_step: Duration::from_nanos(self.time_step.load(atomic::Ordering::SeqCst)),
-            default_stream_time_step: Duration::from_nanos(
-                self.default_stream_time_step.load(atomic::Ordering::SeqCst),
-            ),
-        }
+    fn db_config(&self) -> DbConfig {
+        self.with_state(|db| db.db_config.clone())
     }
 
     pub fn save_db_state(&self) -> Result<(), Error> {
-        let db_state = self.db_settings();
+        let db_state = self.db_config();
         db_state.write(self.path.join("db_state"))
+    }
+
+    pub fn begin_snapshot(&self) -> SnapshotGuard<'_> {
+        self.snapshot_barrier.begin_snapshot()
+    }
+
+    pub fn flush_all(&self) -> Result<(), Error> {
+        self.with_state(|state| -> Result<(), Error> {
+            // Ensure time-series data is fully flushed
+            for component in state.components.values() {
+                component.sync_all()?;
+            }
+            // Ensure message logs are fully flushed
+            for msg_log in state.msg_logs.values() {
+                msg_log.sync_all()?;
+            }
+            // Additionally, make metadata and schema durable for each component
+            for component_id in state.components.keys() {
+                let comp_dir = self.path.join(component_id.to_string());
+                let schema_path = comp_dir.join("schema");
+                if schema_path.exists() {
+                    let file = File::open(&schema_path)?;
+                    file.sync_all()?;
+                }
+                let metadata_path = comp_dir.join("metadata");
+                if metadata_path.exists() {
+                    let file = File::open(&metadata_path)?;
+                    file.sync_all()?;
+                }
+                if comp_dir.exists() {
+                    // Best-effort sync of the component directory entry
+                    let _ = sync_dir(&comp_dir);
+                }
+            }
+            Ok(())
+        })?;
+
+        let db_state_path = self.path.join("db_state");
+        if db_state_path.exists() {
+            File::open(&db_state_path)?.sync_all()?;
+        }
+        File::open(&self.path)?.sync_all()?;
+        Ok(())
+    }
+
+    pub fn copy_native(&self, target_db_path: impl AsRef<Path>) -> Result<PathBuf, Error> {
+        let final_db_dir = target_db_path.as_ref().to_path_buf();
+        let parent_dir = final_db_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        if self.path.starts_with(&final_db_dir) || final_db_dir.starts_with(&self.path) {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target directory overlaps database path",
+            )));
+        }
+
+        if final_db_dir.exists() {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "target directory already exists",
+            )));
+        }
+
+        fs::create_dir_all(&parent_dir)?;
+        let tmp_db_dir = {
+            let name = final_db_dir
+                .file_name()
+                .unwrap_or(OsStr::new("db"))
+                .to_string_lossy();
+            parent_dir.join(format!("{}.tmp", name))
+        };
+        if tmp_db_dir.exists() {
+            fs::remove_dir_all(&tmp_db_dir)?;
+        }
+        fs::create_dir_all(&tmp_db_dir)?;
+        copy_dir_native(&self.path, &tmp_db_dir)?;
+        sync_dir(&tmp_db_dir)?;
+        fs::rename(&tmp_db_dir, &final_db_dir)?;
+        sync_dir(&parent_dir)?;
+        Ok(final_db_dir)
     }
 
     pub fn open(path: PathBuf) -> Result<Self, Error> {
@@ -148,13 +401,14 @@ impl DB {
         let mut start_timestamp = i64::MAX;
 
         info!("Opening database: {}", path.display());
+        let db_state_path = path.join("db_state");
+        if !db_state_path.exists() {
+            return Err(Error::MissingDbState(db_state_path));
+        }
         for elem in std::fs::read_dir(&path)? {
             let Ok(elem) = elem else { continue };
             let path = elem.path();
-            if !path.is_dir()
-                || path.file_name() == Some(OsStr::new("assets"))
-                || path.file_name() == Some(OsStr::new("msgs"))
-            {
+            if !path.is_dir() || path.file_name() == Some(OsStr::new("msgs")) {
                 trace!("Skipping non-component directory: {}", path.display());
                 continue;
             }
@@ -166,13 +420,25 @@ impl DB {
                     .ok_or(Error::InvalidComponentId)?,
             );
 
-            let schema = ComponentSchema::read(path.join("schema"))?;
-            let metadata = ComponentMetadata::read(path.join("metadata"))?;
-            trace!("Read component metadata for {}", metadata.name);
-            component_metadata.insert(component_id, metadata);
+            let metadata_path = path.join("metadata");
+            if metadata_path.exists() {
+                let metadata = ComponentMetadata::read(metadata_path)?;
+                trace!("Read component metadata for {}", metadata.name);
+                component_metadata.insert(component_id, metadata);
+            }
+
+            let schema_path = path.join("schema");
+            if !schema_path.exists() {
+                warn!(
+                    component.id = ?component_id.0,
+                    component.dir = %path.display(),
+                    "Skipping component without schema while opening database"
+                );
+                continue;
+            }
 
             trace!("Opening component file {}", path.display());
-
+            let schema = ComponentSchema::read(schema_path)?;
             let component = Component::open(&path, component_id, schema.clone())?;
             if let Some((timestamp, _)) = component.time_series.latest() {
                 last_updated = timestamp.0.max(last_updated);
@@ -203,11 +469,10 @@ impl DB {
         }
 
         info!(db.path = ?path, "opened db");
-        let db_state = DbSettings::read(path.join("db_state"))?;
+        let db_state = DbConfig::read(db_state_path)?;
         let state = State {
             components,
             component_metadata,
-            assets: open_assets(&path)?,
             msg_logs,
             ..Default::default()
         };
@@ -218,10 +483,10 @@ impl DB {
         };
         Ok(DB {
             state: RwLock::new(state),
+            snapshot_barrier: SnapshotBarrier::new(),
             path,
             vtable_gen: AtomicCell::new(0),
             recording_cell: PlayingCell::new(db_state.recording),
-            time_step: AtomicU64::new(db_state.time_step.as_nanos() as u64),
             default_stream_time_step: AtomicU64::new(
                 db_state.default_stream_time_step.as_nanos() as u64
             ),
@@ -230,12 +495,9 @@ impl DB {
         })
     }
 
-    pub fn time_step(&self) -> Duration {
-        Duration::from_nanos(self.time_step.load(atomic::Ordering::Relaxed))
-    }
-
     pub fn insert_vtable(&self, vtable: VTableMsg) -> Result<(), Error> {
         info!(id = ?vtable.id, "inserting vtable");
+        let _snapshot_guard = self.snapshot_barrier.enter_writer();
         self.with_state_mut(|state| {
             for res in vtable.vtable.realize_fields(None) {
                 let RealizedField {
@@ -254,11 +516,8 @@ impl DB {
         Ok(())
     }
 
-    pub fn insert_asset(&self, id: AssetId, buf: &[u8]) -> Result<(), Error> {
-        self.with_state_mut(|state| assets::insert_asset(&self.path, &mut state.assets, id, buf))
-    }
-
     pub fn push_msg(&self, timestamp: Timestamp, id: PacketId, msg: &[u8]) -> Result<(), Error> {
+        let _snapshot_guard = self.snapshot_barrier.enter_writer();
         let exists = self.with_state(|s| {
             if let Some(msg_log) = s.msg_logs.get(&id) {
                 msg_log.push(timestamp, msg)?;
@@ -324,7 +583,6 @@ impl State {
             component_id,
             name: component_id.to_string(),
             metadata: Default::default(),
-            asset: false,
         };
         let component = Component::create(db_path, component_id, schema, Timestamp::now())?;
         if !self.component_metadata.contains_key(&component_id) {
@@ -589,10 +847,15 @@ impl Component {
     fn get_range(&self, range: Range<Timestamp>) -> Option<(&[Timestamp], &[u8])> {
         self.time_series.get_range(range)
     }
+
+    fn sync_all(&self) -> Result<(), Error> {
+        self.time_series.sync_all()
+    }
 }
 
 struct DBSink<'a> {
     components: &'a HashMap<ComponentId, Component>,
+    snapshot_barrier: &'a SnapshotBarrier,
     last_updated: &'a AtomicCell<Timestamp>,
     sunk_new_time_series: bool,
     table_received: Timestamp,
@@ -606,13 +869,41 @@ impl Decomponentize for DBSink<'_> {
         value: impeller2::types::ComponentView<'_>,
         timestamp: Option<Timestamp>,
     ) -> Result<(), Error> {
-        let timestamp = timestamp.unwrap_or(self.table_received);
+        let _snapshot_guard = self.snapshot_barrier.enter_writer();
+        let mut timestamp = timestamp.unwrap_or(self.table_received);
         let value_buf = value.as_bytes();
         let Some(component) = self.components.get(&component_id) else {
             return Err(Error::ComponentNotFound(component_id));
         };
         let time_series_empty = component.time_series.index().is_empty();
-        component.time_series.push_buf(timestamp, value_buf)?;
+        // In auto-timestamp mode (no explicit timestamp provided), concurrent writers
+        // may occasionally observe a slightly newer last timestamp and reject with
+        // TimeTravel. In that case, clamp the timestamp to last+1 and retry.
+        if let Err(err) = component.time_series.push_buf(timestamp, value_buf) {
+            match err {
+                Error::TimeTravel if timestamp == self.table_received => {
+                    // Retry with a monotonic bump based on the latest sample seen.
+                    let mut attempts = 0u8;
+                    loop {
+                        if let Some((last_ts, _)) = component.time_series.latest() {
+                            // ensure strictly non-decreasing order
+                            timestamp = Timestamp(last_ts.0.saturating_add(1));
+                        } else {
+                            timestamp = Timestamp::now();
+                        }
+                        match component.time_series.push_buf(timestamp, value_buf) {
+                            Ok(()) => break,
+                            Err(Error::TimeTravel) if attempts < 8 => {
+                                attempts = attempts.saturating_add(1);
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                other => return Err(other),
+            }
+        }
         if time_series_empty {
             debug!("sunk new time series for component {}", component_id);
             self.sunk_new_time_series = true;
@@ -701,7 +992,7 @@ async fn handle_conn_inner<A: AsyncRead + AsyncWrite + 'static>(
             Ok(_) => {}
             Err(err) if err.is_stream_closed() => {}
             Err(err) => {
-                warn!(?err, "error handling packet");
+                debug!(?err, "error handling packet");
                 if let Err(err) = pkt_tx
                     .send_msg(&ErrorResponse {
                         description: err.to_string(),
@@ -836,9 +1127,6 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 if let Some(timestamp) = set_stream_state.timestamp {
                     state.set_timestamp(timestamp);
                 }
-                if let Some(time_step) = set_stream_state.time_step {
-                    state.set_time_step(time_step);
-                }
                 if let Some(frequency) = set_stream_state.frequency {
                     state.set_frequency(frequency);
                 }
@@ -885,6 +1173,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             tx.send_time_series(id, timestamps, data).await?;
         }
         Packet::Msg(m) if m.id == SetComponentMetadata::ID => {
+            let _snapshot_guard = db.snapshot_barrier.enter_writer();
             let SetComponentMetadata(metadata) = m.parse::<SetComponentMetadata>()?;
             db.with_state_mut(|state| state.set_component_metadata(metadata, &db.path))?;
         }
@@ -909,34 +1198,6 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             .await?;
         }
 
-        Packet::Msg(m) if m.id == SetAsset::ID => {
-            let set_asset = m.parse::<SetAsset<'_>>()?;
-            db.insert_asset(set_asset.id, &set_asset.buf)?;
-        }
-        Packet::Msg(m) if m.id == GetAsset::ID => {
-            let GetAsset { id } = m.parse::<GetAsset>()?;
-
-            tx.send_with_builder(|pkt| {
-                let header = PacketHeader {
-                    packet_ty: impeller2::types::PacketTy::Msg,
-                    id: Asset::ID,
-                    req_id: m.req_id,
-                };
-                pkt.as_mut_packet().header = header;
-                pkt.clear();
-                db.with_state(|state| {
-                    let Some(mmap) = state.assets.get(&id) else {
-                        return Err(Error::AssetNotFound(id));
-                    };
-                    let asset = Asset {
-                        id,
-                        buf: Cow::Borrowed(&mmap[..]),
-                    };
-                    postcard::serialize_with_flavor(&asset, pkt).map_err(Error::from)
-                })
-            })
-            .await?;
-        }
         Packet::Msg(m) if m.id == DumpMetadata::ID => {
             let msg = db.with_state(|state| {
                 let component_metadata = state.component_metadata.values().cloned().collect();
@@ -950,6 +1211,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 DumpMetadataResp {
                     component_metadata,
                     msg_metadata,
+                    db_config: state.db_config.clone(),
                 }
             });
             tx.send_msg(&msg).await?;
@@ -967,23 +1229,6 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             tx.send_msg(&msg).await?;
         }
 
-        Packet::Msg(m) if m.id == DumpAssets::ID => {
-            // TODO(sphw): Implement dump assets in a no-alloc fashion
-            let packets = db.with_state(|state| {
-                state
-                    .assets
-                    .iter()
-                    .map(|(id, mmap)| Asset {
-                        id: *id,
-                        buf: Cow::Owned(mmap[..].to_vec()),
-                    })
-                    .collect::<Vec<_>>()
-            });
-
-            for packet in packets {
-                tx.send_msg(&packet).await?;
-            }
-        }
         Packet::Msg(m) if m.id == SubscribeLastUpdated::ID => {
             let mut tx = tx.clone();
             let db = db.clone();
@@ -1004,27 +1249,31 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 }
             });
         }
-        Packet::Msg(m) if m.id == SetDbSettings::ID => {
-            let SetDbSettings {
+        Packet::Msg(m) if m.id == SetDbConfig::ID => {
+            let _snapshot_guard = db.snapshot_barrier.enter_writer();
+            let SetDbConfig {
                 recording,
-                time_step,
-            } = m.parse::<SetDbSettings>()?;
+                metadata,
+            } = m.parse::<SetDbConfig>()?;
             if let Some(recording) = recording {
+                db.with_state_mut(|s| {
+                    s.db_config.recording = recording;
+                });
                 db.recording_cell.set_playing(recording);
             }
-            if let Some(time_step) = time_step {
-                db.time_step
-                    .store(time_step.as_nanos() as u64, atomic::Ordering::Release);
-            }
+            db.with_state_mut(|s| {
+                s.db_config.metadata.extend(metadata);
+            });
             db.save_db_state()?;
-            tx.send_msg(&db.db_settings()).await?;
+            drop(_snapshot_guard);
+            tx.send_msg(&db.db_config()).await?;
         }
         Packet::Msg(m) if m.id == GetEarliestTimestamp::ID => {
             tx.send_msg(&EarliestTimestamp(db.earliest_timestamp))
                 .await?;
         }
         Packet::Msg(m) if m.id == GetDbSettings::ID => {
-            let settings = db.db_settings();
+            let settings = db.db_config();
             tx.send_msg(&settings).await?;
         }
         Packet::Table(table) => {
@@ -1032,6 +1281,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             db.with_state(|state| {
                 let mut sink = DBSink {
                     components: &state.components,
+                    snapshot_barrier: &db.snapshot_barrier,
                     last_updated: &db.last_updated,
                     sunk_new_time_series: false,
                     table_received: Timestamp::now(),
@@ -1045,7 +1295,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
         }
 
         Packet::Msg(m) if m.id == GetDbSettings::ID => {
-            let settings = db.db_settings();
+            let settings = db.db_config();
             tx.send_msg(&settings).await?;
         }
         Packet::Msg(m) if m.id == SQLQuery::ID => {
@@ -1080,22 +1330,28 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             tx.send_msg(&ArrowIPC { batch: None }).await?;
         }
         Packet::Msg(m) if m.id == SetMsgMetadata::ID => {
+            let _snapshot_guard = db.snapshot_barrier.enter_writer();
             let SetMsgMetadata { id, metadata } = m.parse::<SetMsgMetadata>()?;
             db.with_state_mut(|s| s.set_msg_metadata(id, metadata, &db.path))?;
+            drop(_snapshot_guard);
         }
         Packet::Msg(m) if m.id == MsgStream::ID => {
+            let _snapshot_guard = db.snapshot_barrier.enter_writer();
             let MsgStream { msg_id } = m.parse::<MsgStream>()?;
             let msg_log =
                 db.with_state_mut(|s| s.get_or_insert_msg_log(msg_id, &db.path).cloned())?;
+            drop(_snapshot_guard);
             let req_id = m.req_id;
             stellarator::spawn(handle_msg_stream(msg_id, req_id, msg_log, tx.tx.clone()));
         }
         Packet::Msg(m) if m.id == FixedRateMsgStream::ID => {
+            let _snapshot_guard = db.snapshot_barrier.enter_writer();
             let FixedRateMsgStream { msg_id, fixed_rate } = m.parse::<FixedRateMsgStream>()?;
             let msg_log =
                 db.with_state_mut(|s| s.get_or_insert_msg_log(msg_id, &db.path).cloned())?;
             let stream_state =
                 db.get_or_insert_fixed_rate_state(fixed_rate.stream_id, fixed_rate.behavior);
+            drop(_snapshot_guard);
             stellarator::spawn(handle_fixed_rate_msg_stream(
                 msg_id,
                 m.req_id,
@@ -1287,11 +1543,6 @@ impl FixedRateStreamState {
         self.current_tick
             .store(timestamp.0, atomic::Ordering::SeqCst);
         self.playing_cell.wait_cell.wake_all();
-    }
-
-    fn set_time_step(&self, time_step: Duration) {
-        self.time_step
-            .store(time_step.as_nanos() as u64, atomic::Ordering::SeqCst);
     }
 
     fn set_frequency(&self, frequency: u64) {
@@ -1610,7 +1861,7 @@ impl PlayingCell {
     }
 }
 
-impl MetadataExt for DbSettings {}
+impl MetadataExt for DbConfig {}
 
 pub trait AtomicTimestampExt {
     fn update_max(&self, val: Timestamp);

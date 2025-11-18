@@ -1,8 +1,9 @@
+#![doc = include_str!("../README.md")]
 extern crate self as nox_ecs;
 
 use crate::utils::SchemaExt;
 use impeller2::types::{ComponentId, EntityId};
-use impeller2_wkt::{EntityMetadata, Material, Mesh};
+use impeller2_wkt::EntityMetadata;
 use nox::xla::{BufferArgsRef, HloModuleProto, PjRtBuffer, PjRtLoadedExecutable};
 use nox::{ArrayTy, Client, CompFn, Noxpr};
 use profile::Profiler;
@@ -15,10 +16,12 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, marker::PhantomData};
 
+pub use crate::archetype::ComponentExt;
+pub use crate::component::Component;
 pub use nox;
+pub use nox::{DefaultRepr, Op, OwnedRepr};
 
 mod archetype;
-mod assets;
 mod component;
 mod dyn_array;
 mod globals;
@@ -34,7 +37,6 @@ pub mod six_dof;
 pub mod world;
 
 pub use archetype::*;
-pub use assets::*;
 pub use component::*;
 pub use dyn_array::*;
 pub use globals::*;
@@ -129,15 +131,15 @@ impl<T: Component + 'static> crate::system::SystemParam for ComponentArray<T> {
     }
 
     fn output(&self, builder: &mut SystemBuilder) -> Result<Noxpr, Error> {
-        if let Some(var) = builder.vars.get_mut(&T::COMPONENT_ID) {
-            if var.entity_map != self.entity_map {
-                return Ok(update_var(
-                    &var.entity_map,
-                    &self.entity_map,
-                    &var.buffer,
-                    &self.buffer,
-                ));
-            }
+        if let Some(var) = builder.vars.get_mut(&T::COMPONENT_ID)
+            && var.entity_map != self.entity_map
+        {
+            return Ok(update_var(
+                &var.entity_map,
+                &self.entity_map,
+                &var.buffer,
+                &self.buffer,
+            ));
         }
         Ok(self.buffer.clone())
     }
@@ -163,10 +165,10 @@ pub fn update_var(
             let mut stop = shape.clone();
             stop[0] = *update_index as i64 + 1;
             let start = std::iter::once(*update_index as i64)
-                .chain(std::iter::repeat(0).take(shape.len() - 1))
+                .chain(std::iter::repeat_n(0, shape.len() - 1))
                 .collect();
             let existing_index = std::iter::once((*existing_index as i64).constant())
-                .chain(std::iter::repeat(0i64.constant()).take(shape.len() - 1))
+                .chain(std::iter::repeat_n(0i64.constant(), shape.len() - 1))
                 .collect();
             buffer.dynamic_update_slice(
                 existing_index,
@@ -371,6 +373,16 @@ impl Exec {
     }
 }
 
+impl<S: ExecState> Exec<S> {
+    pub fn metadata(&self) -> &ExecMetadata {
+        &self.metadata
+    }
+
+    pub fn hlo_module(&self) -> &HloModuleProto {
+        &self.hlo_module
+    }
+}
+
 impl Exec<Compiled> {
     fn run(&mut self, client: &mut Buffers<PjRtBuffer>) -> Result<(), Error> {
         let mut buffers = BufferArgsRef::default().untuple_result(true);
@@ -542,12 +554,6 @@ where
     }
 }
 
-#[derive(Archetype)]
-pub struct Shape {
-    pub mesh: Handle<Mesh>,
-    pub material: Handle<Material>,
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("nox {0}")]
@@ -585,8 +591,6 @@ impl From<nox::xla::Error> for Error {
 mod tests {
     use super::*;
     use crate::{Archetype, World};
-    use assets::Handle;
-    use impeller2_wkt::Glb;
     use nox::{Op, OwnedRepr, Scalar, Vector, tensor};
     use nox_ecs_macros::ReprMonad;
 
@@ -672,24 +676,6 @@ mod tests {
             v.typed_buf::<f64>().unwrap(),
             &[4.0, 5.5, 3.0, 12.0, 1.0, -2.0]
         )
-    }
-
-    #[test]
-    fn test_assets() {
-        #[derive(Component, ReprMonad)]
-        struct A<R: OwnedRepr = Op>(Scalar<f64, R>);
-
-        #[derive(Archetype)]
-        struct Body {
-            glb: Handle<Glb>,
-            a: A,
-        }
-        let mut world = World::default();
-        let body = Body {
-            glb: world.insert_asset(Glb("foo-bar".to_string())),
-            a: A(1.0.into()),
-        };
-        world.spawn(body);
     }
 
     #[test]

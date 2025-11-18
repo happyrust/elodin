@@ -1,6 +1,6 @@
 [package]
 name = "elodin-editor"
-license = "GPL-3.0"
+license = "MIT OR Apache-2.0"
 description = "Elodin Editor"
 version.workspace = true
 edition = "2024"
@@ -8,15 +8,18 @@ publish = false
 
 [features]
 cargo-clippy = []
+inspector = ["dep:bevy-inspector-egui"]
+debug = ["big_space/debug"]
 
 [dependencies]
 # math
 nox.path = "../nox"
 nox.default-features = false
+egui_material_icons = "0.3"
 
 # bevy
 bevy.version = "0.16"
-bevy.features = ["wayland", "file_watcher"]
+bevy.features = ["wayland"]
 bevy_render.version = "0.16"
 bevy_color.version = "0.16"
 bevy_egui.version = "0.34.0-rc.2"
@@ -24,32 +27,28 @@ egui.version = "0.31"
 egui.features = ["rayon"]
 egui_tiles = "0.12"
 egui_table = "0.3"
-winit.version = "0.30"
+winit.version = "0.30.12"
 winit.features = ["rwh_05"]
 raw-window-handle = "0.5"
-bevy_infinite_grid.git = "https://github.com/Cyannide/bevy_infinite_grid.git"
-bevy_infinite_grid.branch = "bevy-0.16"
-big_space.git = "https://github.com/elodin-sys/big_space.git"
-big_space.branch = "no_prop_rot_v0.16"
-bevy_editor_cam.git = "https://github.com/tomara-x/bevy_editor_cam.git"
-bevy_editor_cam.branch = "bevy-0.16"
-bevy_framepace.git = "https://github.com/aloucks/bevy_framepace.git"
-bevy_framepace.branch = "bevy-0.16"
+bevy_infinite_grid = "0.15"
+big_space.version = "0.5"
+bevy_editor_cam = "0.6"
+bevy_framepace = "0.19"
 
 # rand
 fastrand.version = "2"
 
 # lock
 spin = { version = "0.9.8", default-features = false, features = [
-    "use_ticket_mutex",
-    "rwlock",
+  "use_ticket_mutex",
+  "rwlock",
 ] }
 
 # protocols
 postcard.version = "1.0.8"
 reqwest = { version = "0.12", features = [
-    "rustls-tls",
-    "gzip",
+  "rustls-tls",
+  "gzip",
 ], default-features = false }
 impeller2.path = "../../libs/impeller2"
 impeller2.features = ["hifitime"]
@@ -99,7 +98,8 @@ peg = "0.8.5"
 
 # eql
 eql.path = "../db/eql"
-convert_case = "0.6.0"
+bevy-inspector-egui.version = "0.31"
+bevy-inspector-egui.optional = true
 
 
 [target.'cfg(target_family = "wasm")'.dependencies]
@@ -131,8 +131,9 @@ impeller2-bevy.default-features = false
 
 # macos
 [target.'cfg(target_os = "macos")'.dependencies]
-cocoa = "0.26.0"
-objc = "0.2.7"
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSWindow", "NSToolbar", "NSColor", "NSApplication", "NSImage", "all"] }
+objc2-foundation = { version = "0.2", features = ["NSData", "all"] }
 video-toolbox.path = "../video-toolbox"
 
 # windows

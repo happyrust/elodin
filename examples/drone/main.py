@@ -25,7 +25,7 @@ EDU_450_CONFIG = Config(
         attitude_control_input_tc=0.1,
         pilot_yaw_rate_tc=0.1,
     ),
-    drone_glb="https://storage.googleapis.com/elodin-assets/edu-450-v2-drone.glb",
+    drone_glb="https://assets.elodin.systems/assets/edu-450-v2-drone.glb",
     mass=1.0,
     inertia_diagonal=np.array([0.1, 0.1, 0.2]),
     start_pos=np.array([0.0, 0.0, 2.0]),
@@ -94,7 +94,7 @@ TALON_QUAD_CONFIG = Config(
         attitude_control_input_tc=0.2,  # soft
         pilot_yaw_rate_tc=0.25,  # soft
     ),
-    drone_glb="https://storage.googleapis.com/elodin-assets/talon-quad-v2.glb",
+    drone_glb="https://assets.elodin.systems/assets/talon-quad-v2.glb",
     mass=2.586,
     inertia_diagonal=np.array([0.0854, 0.1149, 0.1604]),
     start_pos=np.array([0.0, 0.0, 2.0]),
@@ -138,6 +138,6 @@ else:
     world.run(
         system(),
         sim_time_step=Config.GLOBAL.dt,
-        run_time_step=0.0,
-        max_ticks=int(Config.GLOBAL.total_sim_ticks),
+        run_time_step=1.0 / 60.0,
+        max_ticks=int(Config.GLOBAL.total_sim_ticks or 1200),
     )

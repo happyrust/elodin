@@ -10,14 +10,14 @@ use super::{colors::get_scheme, widgets::WidgetSystem};
 #[derive(Clone)]
 pub struct MonitorPane {
     pub label: String,
-    pub component_id: ComponentId,
+    pub component_name: String,
 }
 
 impl MonitorPane {
-    pub fn new(label: String, component_id: ComponentId) -> Self {
+    pub fn new(label: String, component_name: String) -> Self {
         Self {
             label,
-            component_id,
+            component_name,
         }
     }
 }
@@ -45,10 +45,11 @@ impl WidgetSystem for MonitorWidget<'_, '_> {
             mut component_value_query,
             entity_map,
         } = state.get_mut(world);
-        let Some(entity) = entity_map.get(&pane.component_id) else {
+        let component_id = ComponentId::new(&pane.component_name);
+        let Some(entity) = entity_map.get(&component_id) else {
             return;
         };
-        let Some(metadata) = metadata_store.get_metadata(&pane.component_id) else {
+        let Some(metadata) = metadata_store.get_metadata(&component_id) else {
             return;
         };
 
@@ -79,14 +80,14 @@ impl WidgetSystem for MonitorWidget<'_, '_> {
                     {
                         let layout = egui::Layout::centered_and_justified(ui.layout().main_dir());
 
-                        ui.allocate_ui_with_layout([220., 170.].into(), layout, |ui| {
+                        ui.allocate_ui_with_layout([130., 60.].into(), layout, |ui| {
                             Frame::NONE
                                 .stroke(Stroke::new(1.0, get_scheme().border_primary))
                                 .outer_margin(egui::Margin::symmetric(8, 8))
                                 .inner_margin(egui::Margin::symmetric(8, 0))
                                 .show(ui, |ui| {
-                                    ui.set_width(210. - 8.);
-                                    ui.set_height(150.);
+                                    ui.set_width(120. - 8.);
+                                    ui.set_height(50.);
                                     ui.with_layout(
                                         egui::Layout::bottom_up(egui::Align::LEFT),
                                         |ui| {
@@ -120,10 +121,14 @@ impl WidgetSystem for MonitorWidget<'_, '_> {
                                                     v.to_string()
                                                 }
                                                 impeller2_bevy::ElementValueMut::F64(v) => {
-                                                    format!("{v:.8}")
+                                                    let mut str = format!("{v:.8}");
+                                                    str.truncate(10);
+                                                    str
                                                 }
                                                 impeller2_bevy::ElementValueMut::F32(v) => {
-                                                    format!("{v:.8}")
+                                                    let mut str = format!("{v:.8}");
+                                                    str.truncate(10);
+                                                    str
                                                 }
                                                 impeller2_bevy::ElementValueMut::Bool(v) => {
                                                     v.to_string()

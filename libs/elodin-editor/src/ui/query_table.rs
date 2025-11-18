@@ -6,13 +6,16 @@ use arrow::{
 };
 use bevy::{
     ecs::system::SystemParam,
-    prelude::{Commands, Component, Entity, In, Query, Res},
+    prelude::{Commands, Component, Entity, In, Query, Res, ResMut},
 };
 use egui::{RichText, Stroke};
+use impeller2::types::Timestamp;
 use impeller2_bevy::CommandsExt;
-use impeller2_wkt::{ArrowIPC, ErrorResponse, QueryTable, QueryType, SQLQuery};
+use impeller2_wkt::{
+    ArrowIPC, EarliestTimestamp, ErrorResponse, LastUpdated, QueryTable, QueryType, SQLQuery,
+};
 
-use crate::EqlContext;
+use crate::{EqlContext, SelectedTimeRange};
 
 use super::{
     button::EButton,
@@ -113,7 +116,7 @@ impl egui_table::TableDelegate for QueryTableResults<'_> {
         let offset = cell.row_nr as usize - count;
         let formatters = &self.formatters[cell.col_nr];
         let formatter = &formatters[batch_i];
-        if cell.row_nr % 2 == 0 {
+        if cell.row_nr.is_multiple_of(2) {
             ui.painter().rect_filled(
                 ui.max_rect(),
                 egui::CornerRadius::ZERO,
@@ -137,7 +140,10 @@ impl egui_table::TableDelegate for QueryTableResults<'_> {
 #[derive(SystemParam)]
 pub struct QueryTableWidget<'w, 's> {
     states: Query<'w, 's, &'static mut QueryTableData>,
-    eql_context: Res<'w, EqlContext>,
+    eql_context: ResMut<'w, EqlContext>,
+    selected_range: Res<'w, SelectedTimeRange>,
+    earliest_timestamp: Res<'w, EarliestTimestamp>,
+    last_updated: Res<'w, LastUpdated>,
     commands: Commands<'w, 's>,
 }
 
@@ -154,12 +160,40 @@ impl WidgetSystem for QueryTableWidget<'_, '_> {
     ) -> Self::Output {
         let QueryTableWidget {
             mut states,
-            eql_context,
+            mut eql_context,
+            selected_range,
+            earliest_timestamp,
+            last_updated,
             mut commands,
         } = state.get_mut(world);
         let Ok(mut table) = states.get_mut(entity) else {
             return;
         };
+
+        {
+            use std::cmp::{max, min};
+
+            let mut start = selected_range.0.start;
+            let mut end = selected_range.0.end;
+            let placeholder_start = Timestamp(i64::MIN);
+            let placeholder_end = Timestamp(i64::MAX);
+
+            if start == placeholder_start && end == placeholder_end {
+                start = earliest_timestamp.0;
+                end = last_updated.0;
+            }
+
+            if start > end {
+                start = min(earliest_timestamp.0, last_updated.0);
+                end = max(earliest_timestamp.0, last_updated.0);
+            }
+
+            eql_context.0.earliest_timestamp = start;
+            eql_context.0.last_timestamp = end;
+        }
+
+        let context = &eql_context.0;
+
         ui.horizontal_top(|ui| {
             egui::Frame::NONE
                 .inner_margin(egui::Margin::same(8))
@@ -226,10 +260,9 @@ impl WidgetSystem for QueryTableWidget<'_, '_> {
                             });
                         if let (QueryType::EQL, QueryType::SQL) =
                             (prev_query_type, table.data.query_type)
+                            && let Ok(sql) = context.sql(&table.data.query)
                         {
-                            if let Ok(sql) = eql_context.0.sql(&table.data.query) {
-                                table.data.query = sql;
-                            }
+                            table.data.query = sql;
                         }
                     });
                     ui.add_space(8.0);
@@ -238,7 +271,7 @@ impl WidgetSystem for QueryTableWidget<'_, '_> {
                     if table.data.query_type == QueryType::EQL {
                         eql_autocomplete(
                             ui,
-                            &eql_context.0,
+                            context,
                             &text_edit_res
                                 .clone()
                                 .with_new_rect(text_edit_res.rect.expand2(egui::vec2(0.0, 8.0))),
@@ -252,7 +285,7 @@ impl WidgetSystem for QueryTableWidget<'_, '_> {
                         table.state = QueryTableState::Requested(Instant::now());
                         let query = match table.data.query_type {
                             QueryType::SQL => table.data.query.to_string(),
-                            QueryType::EQL => match eql_context.0.sql(&table.data.query) {
+                            QueryType::EQL => match context.sql(&table.data.query) {
                                 Ok(sql) => sql,
                                 Err(err) => {
                                     table.state = QueryTableState::Error(ErrorResponse {

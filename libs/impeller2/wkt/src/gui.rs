@@ -1,6 +1,6 @@
 use crate::Color;
 use impeller2::component::Asset;
-use impeller2::types::{ComponentId, EntityId};
+use impeller2::types::EntityId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -37,6 +37,8 @@ pub enum SchematicElem<T = ()> {
     Panel(Panel<T>),
     Object3d(Object3D<T>),
     Line3d(Line3d<T>),
+    VectorArrow(VectorArrow3d<T>),
+    Window(WindowSchematic),
 }
 
 impl<T> SchematicElem<T> {
@@ -45,8 +47,16 @@ impl<T> SchematicElem<T> {
             SchematicElem::Panel(panel) => SchematicElem::Panel(panel.map_aux(|_| ())),
             SchematicElem::Object3d(obj) => SchematicElem::Object3d(obj.map_aux(|_| ())),
             SchematicElem::Line3d(line) => SchematicElem::Line3d(line.map_aux(|_| ())),
+            SchematicElem::VectorArrow(arrow) => SchematicElem::VectorArrow(arrow.map_aux(|_| ())),
+            SchematicElem::Window(window) => SchematicElem::Window(window),
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct WindowSchematic {
+    pub title: Option<String>,
+    pub path: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -148,6 +158,8 @@ pub struct Split<T = ()> {
     pub panels: Vec<Panel<T>>,
     pub shares: HashMap<usize, f32>,
     pub active: bool,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl<T> Split<T> {
@@ -156,6 +168,7 @@ impl<T> Split<T> {
             panels: self.panels.iter().map(|p| p.map_aux(&f)).collect(),
             shares: self.shares.clone(),
             active: self.active,
+            name: self.name.clone(),
         }
     }
 }
@@ -219,6 +232,7 @@ pub struct Graph<T = ()> {
     pub auto_y_range: bool,
     pub y_range: Range<f64>,
     pub aux: T,
+    pub colors: Vec<crate::Color>,
 }
 
 impl<T> Graph<T> {
@@ -230,6 +244,7 @@ impl<T> Graph<T> {
             auto_y_range: self.auto_y_range,
             y_range: self.y_range.clone(),
             aux: f(&self.aux),
+            colors: self.colors.clone(),
         }
     }
 }
@@ -270,24 +285,55 @@ impl<T: Serialize + DeserializeOwned> Asset for Line3d<T> {
     const NAME: &'static str = "line_3d";
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "T: Serialize + DeserializeOwned")]
+#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
+pub struct VectorArrow3d<T = ()> {
+    pub vector: String,
+    pub origin: Option<String>,
+    #[serde(default = "VectorArrow3d::<T>::default_scale")]
+    pub scale: f64,
+    pub name: Option<String>,
+    #[serde(default = "VectorArrow3d::<T>::default_color")]
+    pub color: Color,
+    #[serde(default)]
+    #[serde(alias = "in_body_frame")]
+    pub body_frame: bool,
+    #[serde(default)]
+    pub normalize: bool,
+    pub aux: T,
+}
+
+impl<T> VectorArrow3d<T> {
+    fn default_scale() -> f64 {
+        1.0
+    }
+
+    fn default_color() -> Color {
+        Color::WHITE
+    }
+
+    pub fn map_aux<U>(&self, f: impl Fn(&T) -> U) -> VectorArrow3d<U> {
+        VectorArrow3d {
+            vector: self.vector.clone(),
+            origin: self.origin.clone(),
+            scale: self.scale,
+            name: self.name.clone(),
+            color: self.color,
+            body_frame: self.body_frame,
+            normalize: self.normalize,
+            aux: f(&self.aux),
+        }
+    }
+}
+
+impl<T: Serialize + DeserializeOwned> Asset for VectorArrow3d<T> {
+    const NAME: &'static str = "vector_arrow";
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 pub struct Camera;
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
-pub struct VectorArrow {
-    pub id: ComponentId,
-    pub range: Range<usize>,
-    pub color: Color,
-    pub attached: bool,
-    pub body_frame: bool,
-    pub scale: f32,
-}
-
-impl Asset for VectorArrow {
-    const NAME: &'static str = "arrow";
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
@@ -306,6 +352,7 @@ pub enum Mesh {
     Sphere { radius: f32 },
     Box { x: f32, y: f32, z: f32 },
     Cylinder { radius: f32, height: f32 },
+    Plane { width: f32, depth: f32 },
 }
 
 impl Mesh {
@@ -315,6 +362,10 @@ impl Mesh {
 
     pub fn sphere(radius: f32) -> Self {
         Self::Sphere { radius }
+    }
+
+    pub fn plane(width: f32, depth: f32) -> Self {
+        Self::Plane { width, depth }
     }
 }
 
@@ -342,17 +393,40 @@ impl Material {
             base_color: Color::rgb(r, g, b),
         }
     }
+
+    pub fn color_with_alpha(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Material {
+            base_color: Color::rgba(r, g, b, a),
+        }
+    }
 }
 
 impl Asset for Material {
     const NAME: &'static str = "material";
 }
 
+pub fn default_ellipsoid_scale_expr() -> String {
+    "(1, 1, 1)".to_string()
+}
+
+pub fn default_ellipsoid_color() -> Color {
+    Color::WHITE
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 pub enum Object3DMesh {
     Glb(String),
-    Mesh { mesh: Mesh, material: Material },
+    Mesh {
+        mesh: Mesh,
+        material: Material,
+    },
+    Ellipsoid {
+        #[serde(default = "default_ellipsoid_scale_expr")]
+        scale: String,
+        #[serde(default = "default_ellipsoid_color")]
+        color: Color,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -381,7 +455,11 @@ impl Asset for Object3D {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 pub struct ComponentMonitor {
-    pub component_id: ComponentId,
+    /// The component name that we are monitoring.
+    ///
+    /// NOTE: It may be nice to allow this to be an EQL expression that we
+    /// monitor, which can be a simple component_name.
+    pub component_name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

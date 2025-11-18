@@ -13,6 +13,76 @@ order = 1
 +++
 
 
+## v0.15
+
+### v0.15.3
+- **(feat)** Add "Clear Schematic" to command palette. (#276)
+- **(feat)** Add "Create Window" to command palette. (#293)
+- **(feat)** Add multiple window support from KDL. (#275)
+- **(feat)** Implement `wait_for_write` functionality. (#277)
+- **(feat)** Provide packet ID on no vtable error. (#287)
+- **(feat)** Allow conditional systems. (#269)
+- **(fix)** Avoid divide by zero on plot. (#270)
+- **(fix)** Resize monitor boxes. (#286)
+- **(fix)** Axes widget matches world. (#282)
+- **(chore)** Switch some bevy dependencies to upstream sources. (#280)
+
+### v0.15.2
+- **(feat)** Add native DB snapshot support. (#233)
+- **(feat)** ELODIN_KDL_DIR can specify schematics directory. (#244)
+- **(feat)** Add `normalize` and `body_frame` to vector_arrow. (#217) (#223)
+- **(feat)** Add compass mesh. (#253)
+- **(feat)** Add object3d plane. (#226)
+- **(feat)** Refactor EQL formulas. (#248) (#242)
+- **(feat)** Make firmware log more about its state. (#215)
+- **(doc)** Improve first-time developer experience. (#257)
+- **(fix)** Remove component ID from inspector header. (#224)
+- **(fix)** Keep viewport KDL flags consistent across schematic save and load. (#212)
+- **(fix)** Validate command-palette time range input and guard runtime selection. (#252)
+- **(fix)** Don't snake_case component names in editor. (#236)
+- **(chore)** Consolidate examples at root. (#249)
+- **(chore)** Move Aleph to repo root. (#237)
+- **(chore)** Migrate Continuous Integration (CI) to AWS. (#254)
+- **(chore)** Update to Rust 1.90.0 (#194)
+- **(chore)** Remove 'elodin create' command. (#213)
+
+### v0.15.1
+- **(feat)** UI: Display tick count and add "Goto tick…" command. (#196)
+- **(feat)** Restore vector arrow schematic support. (#210)
+- **(feat)** Add 3D ellipsoid mesh and color transparency support. (#201)
+- **(feat)** UI: Add custom graph line colors in KDL. (#193)
+- **(feat)** Add new EQL formula `norm()`.
+- **(doc)** Extend `nox-ecs` [README example][nox-ecs] with symbolic graph evaluation.
+- **(doc)** Add READMEs for EQL plus HOWTO and  [`nox`][nox], [`nox-ecs`][nox-ecs], and [`nox-ecs-macros`][nox-ecs-macros]. 
+- **(fix)** Do not panic on invalid KDL instead show a helpful error message. (#202)
+- **(fix)** Ensure LFS file is not an LFS file pointer. (#206)
+- **(fix)** Fix DB connection thread leak. (#198)
+- **(fix)** UI: restore graph inspector on title click to fix regression. (#199)
+- **(fix)** Fix the component monitor serialization. (#189)
+- **(fix)** Fix stackoverflow when evaluating larger `noxpr` expression graphs. (#129)
+- **(chore)** Update Nix development environment. (#182)
+
+[nox]: https://github.com/elodin-sys/elodin/tree/main/libs/nox
+[nox-ecs]: https://github.com/elodin-sys/elodin/tree/main/libs/nox-ecs
+[nox-ecs-macros]: https://github.com/elodin-sys/elodin/tree/main/libs/nox-ecs-macros
+
+### v0.15.0
+- **(feat)** UI: Lock graphs to same x-axis zoom
+- **(feat)** UI: Editable panel titles
+- **(feat)** UI: Sort components alphabetically by name
+- **(feat)** Add DeepStream binary to Aleph
+- **(feat)** Add Rust example: Rocket Trim Client Control
+- **(feat)** Allow custom save location for DB
+- **(feat)** Add component discovery Python command
+- **(doc)** Add READMEs for `nox/noxpr`, `nox_frames`, `nox_array`
+- **(fix)** Add auto-tick advancement to JaxSim.
+- **(breaking)** Handle UI and object visualization using new schematics format. See [migration guide](/reference/migration/to-0-15).
+- **(fix)** Stop endlessly creating entities for packet handling.
+- **(breaking)** The entity concept was removed from the DB, breaking previous saves.
+- **(breaking)** Replace `set_component_name` with `set_component_metadata` in C++ API to support setting element names.
+- **(breaking)** `exec.history()` now expects a component name, or a list of component names. If multiple component names are provided, they will be joined on the "time" column.
+- **(fix)** Fix bug where component values for tick 0 (initial component values before simulating) and tick 1 would have the same timestamps.
+
 ## v0.14
 
 ### v0.14.2
@@ -362,7 +432,7 @@ name\>" for viewports and "\<entity name\>: \<component name\>" for graphs.
     ```python
     # before:
     w.spawn(el.Body(pbr = w.insert_asset( el.Pbr(el.Mesh.sphere(0.2), el.Material.color(0.0, 10.0, 10.0)))))
-    w.spawn(el.Body(w.insert_asset(el.Pbr.from_url("https://storage.googleapis.com/elodin-assets/earth.glb"))))
+    w.spawn(el.Body(w.insert_asset(el.Pbr.from_url("https://assets.elodin.systems/assets/earth.glb"))))
     # after
     w.spawn([
       el.Body(),
@@ -370,7 +440,7 @@ name\>" for viewports and "\<entity name\>: \<component name\>" for graphs.
     ])
     w.spawn([
       el.Body(),
-      w.glb("https://storage.googleapis.com/elodin-assets/earth.glb")
+      w.glb("https://assets.elodin.systems/assets/earth.glb")
     ])
     ```
 - **(breaking)** Remove `SpatialInertia.from_mass()`.

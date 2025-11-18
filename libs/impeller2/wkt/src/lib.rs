@@ -3,14 +3,12 @@ use impeller2::component::Component;
 use impeller2::types::Timestamp;
 use serde::{Deserialize, Serialize};
 
-mod assets;
 mod metadata;
 mod msgs;
 mod path;
 #[cfg(feature = "nox")]
 mod value;
 
-pub use assets::*;
 pub use metadata::*;
 pub use msgs::*;
 pub use path::*;
@@ -22,6 +20,7 @@ mod gui;
 #[cfg(feature = "gui")]
 pub use gui::*;
 
+// TODO: Consider making this an enum so we can round-trip color names.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Color {
     pub r: f32,
@@ -33,6 +32,15 @@ pub struct Color {
 impl Color {
     pub const BLACK: Self = Self::rgb(0., 0., 0.);
     pub const WHITE: Self = Self::rgb(1., 1., 1.);
+
+    pub const BLUE: Self = Self::rgb(0., 0., 1.);
+    pub const ORANGE: Self = Self::rgb(1., 0.5, 0.);
+    pub const YELLOW: Self = Self::rgb(1., 1., 0.);
+    pub const CYAN: Self = Self::rgb(0., 1., 1.);
+    pub const GRAY: Self = Self::rgb(0.5, 0.5, 0.5);
+    pub const GREEN: Self = Self::rgb(0., 1., 0.);
+    pub const PINK: Self = Self::rgb(1., 0.752_941_2, 0.796_078_44);
+    pub const YALK: Self = Self::rgb(1., 0.9, 0.2);
 
     pub const TURQUOISE: Self = Self::rgb(0.41, 0.7, 0.75);
     pub const SLATE: Self = Self::rgb(0.5, 0.44, 1.);
